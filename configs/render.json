@@ -1,0 +1,38 @@
+{
+    "_comment": "VisionBridge render-node configuration",
+
+    "transport": {
+        "host":          "239.1.1.1",
+        "rtp_port":      5004,
+        "iface":         "",
+        "multicast":     true,
+        "multicast_ttl": 4
+    },
+
+    "codec": {
+        "bitrate_kbps": 4000,
+        "keyint":       1,
+        "hw_encode":    false,
+        "hw_decode":    false
+    },
+
+    "zmq": {
+        "source_endpoint": "tcp://*:5560",
+        "render_endpoint": "tcp://127.0.0.1:5560"
+    },
+
+    "jitter_buffer_ms": 20,
+
+    "display": {
+        "width":             1280,
+        "height":            720,
+        "title":             "VisionBridge",
+        "fullscreen":        false,
+        "sdl_display_index": -1
+    },
+
+    "debug": {
+        "log_level":        2,
+        "stats_interval_s": 10
+    }
+}

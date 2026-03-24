@@ -1,0 +1,62 @@
+{
+    "_comment": "VisionBridge source-node configuration",
+
+    "input": {
+        "type":    "webcam",
+        "device":  "/dev/video0",
+        "file":    "",
+        "width":   1280,
+        "height":  720,
+        "fps_num": 30,
+        "fps_den": 1,
+        "loop":    true
+    },
+
+    "detectors": {
+        "enable_stub":        false,
+        "enable_mog2":        false,
+        "enable_yolo":        true,
+
+        "mog2_history":       500,
+        "mog2_var_threshold": 16.0,
+        "mog2_min_area":      800,
+
+        "yolo": {
+            "_comment":       "Download YOLOv4-tiny: https://github.com/AlexeyAB/darknet/releases",
+            "model":          "models/yolov4-tiny.weights",
+            "config":         "models/yolov4-tiny.cfg",
+            "names":          "models/coco.names",
+            "conf_threshold": 0.40,
+            "nms_threshold":  0.45,
+            "input_width":    416,
+            "input_height":   416,
+            "_comment2":      "filter_classes: leave empty [] to detect all classes, or list class names to detect only those",
+            "filter_classes": []
+        }
+    },
+
+    "transport": {
+        "host":          "239.1.1.1",
+        "rtp_port":      5004,
+        "iface":         "",
+        "multicast":     true,
+        "multicast_ttl": 4
+    },
+
+    "codec": {
+        "bitrate_kbps": 4000,
+        "keyint":       1,
+        "hw_encode":    false,
+        "hw_decode":    false
+    },
+
+    "zmq": {
+        "source_endpoint": "tcp://*:5560",
+        "render_endpoint": "tcp://127.0.0.1:5560"
+    },
+
+    "debug": {
+        "log_level":        2,
+        "stats_interval_s": 10
+    }
+}

@@ -647,12 +647,25 @@ Then set the paths in `configs/source.json`:
 **ONNX alternative:** Set `model` to a `.onnx` file and leave `config` empty.
 OpenCV DNN will auto-detect the format.
 
-**GPU acceleration:** Change the backend/target in `yolo_tracker.cpp`:
-```cpp
-m_net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
-m_net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+**GPU acceleration:** Set `"backend"` in the `yolo` section of `configs/source.json`:
+
+```json
+"yolo": {
+    "backend": "opencl"
+}
 ```
-Requires OpenCV built with CUDA support and an NVIDIA GPU.
+
+| Value | Hardware | Requirement |
+|---|---|---|
+| `"cpu"` | CPU (default) | None |
+| `"opencl"` | Any OpenCL GPU (Intel, AMD, NVIDIA) | OpenCV WITH_OPENCL (on by default) |
+| `"opencl_fp16"` | OpenCL GPU, FP16 (~2× faster) | GPU must support FP16 |
+| `"cuda"` | NVIDIA GPU (FP32) | OpenCV built WITH_CUDA=ON |
+| `"cuda_fp16"` | NVIDIA GPU (FP16) | CUDA + Tensor Core GPU |
+
+OpenCL availability is checked with `cv::ocl::haveOpenCL()` before enabling.
+CUDA falls back to CPU with a warning if unavailable.
+The `"opencl"` backend may segfault on some drivers; use `"cpu"` if unstable.
 
 ---
 

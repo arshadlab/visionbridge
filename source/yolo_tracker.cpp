@@ -9,6 +9,7 @@
 #ifdef DS_HAVE_OPENCV_DNN
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/core/ocl.hpp>
 #include <algorithm>
 #include <cctype>
 #include <fstream>
@@ -59,6 +60,43 @@ bool YoloTracker::init(int width, int height) {
     // Use CPU backend (set DNN_BACKEND_CUDA + DNN_TARGET_CUDA for GPU)
     m_net.setPreferableBackend(cv::dnn::DNN_BACKEND_DEFAULT);
     m_net.setPreferableTarget (cv::dnn::DNN_TARGET_CPU);
+
+    // Apply configured inference backend with graceful CPU fallback.
+    // opencl / opencl_fp16 work on Intel, AMD, and NVIDIA GPUs via OpenCL
+    // (no special OpenCV build needed beyond the default WITH_OPENCL=ON).
+    // cuda / cuda_fp16 require OpenCV built with WITH_CUDA=ON.
+    const std::string& be = m_cfg.yolo.backend;
+    if (be == "opencl" || be == "opencl_fp16") {
+        if (!cv::ocl::haveOpenCL()) {
+            DS_WARN("YoloTracker: backend=%s requested but OpenCL not available — using CPU\n",
+                    be.c_str());
+            m_net.setPreferableBackend(cv::dnn::DNN_BACKEND_DEFAULT);
+            m_net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        } else {
+            const auto target = (be == "opencl_fp16")
+                                ? cv::dnn::DNN_TARGET_OPENCL_FP16
+                                : cv::dnn::DNN_TARGET_OPENCL;
+            m_net.setPreferableBackend(cv::dnn::DNN_BACKEND_DEFAULT);
+            m_net.setPreferableTarget(target);
+            DS_INFO("YoloTracker: backend=%s enabled\n", be.c_str());
+        }
+    } else if (be == "cuda" || be == "cuda_fp16") {
+        const auto target = (be == "cuda_fp16")
+                            ? cv::dnn::DNN_TARGET_CUDA_FP16
+                            : cv::dnn::DNN_TARGET_CUDA;
+        try {
+            m_net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+            m_net.setPreferableTarget(target);
+            DS_INFO("YoloTracker: backend=%s enabled\n", be.c_str());
+        } catch (const cv::Exception& e) {
+            DS_WARN("YoloTracker: backend=%s unavailable (%s) — falling back to CPU\n",
+                    be.c_str(), e.what());
+            m_net.setPreferableBackend(cv::dnn::DNN_BACKEND_DEFAULT);
+            m_net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        }
+    } else {
+        DS_INFO("YoloTracker: backend=cpu\n");
+    }
 
     // Collect names of the output layers (e.g. yolo_82, yolo_94, yolo_106)
     const auto& layer_names = m_net.getLayerNames();

@@ -35,6 +35,9 @@ struct YoloConfig {
     float nms_threshold   = 0.45f;
     int   input_width     = 416;
     int   input_height    = 416;
+    /// Inference backend: "cpu" | "opencl" | "opencl_fp16" | "cuda" | "cuda_fp16"
+    /// Falls back to CPU automatically if the requested backend is unavailable.
+    std::string backend = "cpu";
     /// If non-empty, only detections whose class name appears in this list are
     /// reported.  Names are matched case-insensitively against coco.names.
     /// Empty list = report all classes.

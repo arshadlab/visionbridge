@@ -101,6 +101,7 @@ bool ConfigLoader::load_source(const std::string& path, DsSourceConfig& out) {
                 out.detectors.yolo.nms_threshold  = jget<float>      (y, "nms_threshold",  0.45f);
                 out.detectors.yolo.input_width    = jget<int>        (y, "input_width",    416);
                 out.detectors.yolo.input_height   = jget<int>        (y, "input_height",   416);
+                out.detectors.yolo.backend        = jget<std::string>(y, "backend",        "cpu");
                 // filter_classes: optional array of class name strings
                 if (y.contains("filter_classes") && y.at("filter_classes").is_array()) {
                     for (const auto& item : y.at("filter_classes"))

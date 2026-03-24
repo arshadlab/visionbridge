@@ -30,7 +30,9 @@
             "nms_threshold":  0.45,
             "input_width":    416,
             "input_height":   416,
-            "_comment2":      "filter_classes: leave empty [] to detect all classes, or list class names to detect only those",
+            "backend":        "cpu",
+            "_comment2":      "backend: cpu | opencl | opencl_fp16 | cuda | cuda_fp16",
+            "_comment3":      "filter_classes: leave empty [] to detect all classes, or list class names to detect only those",
             "filter_classes": []
         }
     },

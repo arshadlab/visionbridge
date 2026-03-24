@@ -25,8 +25,8 @@
     "decoder_sync":     false,
 
     "display": {
-        "width":             0,
-        "height":            0,
+        "width":             1280,
+        "height":            720,
         "fps":               30,
         "title":             "VisionBridge",
         "fullscreen":        false,

@@ -38,8 +38,10 @@ bool DisplayOutput::init() {
         return false;
     }
 
-    const int w = static_cast<int>(m_cfg.display_width);
-    const int h = static_cast<int>(m_cfg.display_height);
+    // If display size is 0, open a minimal placeholder; the window is resized
+    // to the first decoded frame's dimensions inside present().
+    const int w = (m_cfg.display_width  > 0) ? static_cast<int>(m_cfg.display_width)  : 1;
+    const int h = (m_cfg.display_height > 0) ? static_cast<int>(m_cfg.display_height) : 1;
 
     m_window = SDL_CreateWindow(m_cfg.display_title.c_str(),
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -61,7 +63,10 @@ bool DisplayOutput::init() {
         DS_ERR("SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return false;
     }
-    SDL_RenderSetLogicalSize(m_renderer, w, h);
+    if (m_cfg.display_width > 0 && m_cfg.display_height > 0) {
+        SDL_RenderSetLogicalSize(m_renderer, w, h);
+        m_window_sized = true;
+    }
 
     // ZMQ PULL socket
     m_zmq_ctx = zmq_ctx_new();
@@ -114,8 +119,13 @@ void DisplayOutput::zmq_recv_loop() {
         if (msg.type != DS_MSG_BBOX) continue;
 
         auto shared = std::make_shared<DsMsgBbox>(msg);
-        std::lock_guard<std::mutex> lk(m_bbox_mtx);
-        m_latest_bbox = std::move(shared);
+        {
+            std::lock_guard<std::mutex> lk(m_bbox_mtx);
+            auto& slot = m_bbox_ring[m_bbox_ring_head % kBboxRingSize];
+            slot.frame_seq = msg.frame_seq;
+            slot.msg       = std::move(shared);
+            ++m_bbox_ring_head;
+        }
     }
     DS_DBG("ZMQ recv thread exiting\n");
 }
@@ -156,6 +166,16 @@ bool DisplayOutput::present() {
         if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) return false;
     }
 
+    // FPS throttle: skip rendering until the next frame interval is due.
+    // This caps file-playback speed without disturbing bbox/video sync.
+    if (m_cfg.display_fps > 0) {
+        const uint64_t frame_interval_us = 1'000'000ULL / m_cfg.display_fps;
+        const uint64_t now = ds_mono_us();
+        if (m_last_present_us != 0 && (now - m_last_present_us) < frame_interval_us)
+            return true; // too soon — yield without rendering
+        m_last_present_us = now;
+    }
+
     // Grab latest frame and bbox for this render cycle (under their respective locks)
     std::shared_ptr<DecodedFrame> frame;
     {
@@ -166,10 +186,43 @@ bool DisplayOutput::present() {
     std::shared_ptr<DsMsgBbox> bbox_msg;
     {
         std::lock_guard<std::mutex> lk(m_bbox_mtx);
-        bbox_msg = m_latest_bbox;
+        // Use sei_frame_seq for exact per-frame correlation when available;
+        // fall back to the most-recently-received bbox otherwise.
+        const uint64_t want_seq = (frame && frame->sei_frame_seq != 0)
+                                  ? frame->sei_frame_seq : 0;
+        std::shared_ptr<DsMsgBbox> latest_msg;
+        uint64_t latest_seq = 0;
+        for (auto& e : m_bbox_ring) {
+            if (!e.msg) continue;
+            if (want_seq != 0 && e.frame_seq == want_seq) {
+                bbox_msg = e.msg;
+                break;
+            }
+            if (e.frame_seq > latest_seq) {
+                latest_seq = e.frame_seq;
+                latest_msg = e.msg;
+            }
+        }
+        if (!bbox_msg)
+            bbox_msg = latest_msg; // SEI absent or no exact match: use newest
     }
 
     if (frame) {
+        // On first frame when display size was 0: resize window to native frame dimensions
+        if (!m_window_sized) {
+            SDL_SetWindowSize(m_window,
+                              static_cast<int>(frame->width),
+                              static_cast<int>(frame->height));
+            SDL_RenderSetLogicalSize(m_renderer,
+                                    static_cast<int>(frame->width),
+                                    static_cast<int>(frame->height));
+            SDL_SetWindowPosition(m_window,
+                                  SDL_WINDOWPOS_CENTERED,
+                                  SDL_WINDOWPOS_CENTERED);
+            DS_INFO("DisplayOutput: window sized to %ux%u (native)\n",
+                    frame->width, frame->height);
+            m_window_sized = true;
+        }
         // Re-create texture if dimensions changed
         if (!m_texture || m_tex_width != frame->width || m_tex_height != frame->height) {
             if (m_texture) SDL_DestroyTexture(m_texture);
@@ -193,10 +246,12 @@ bool DisplayOutput::present() {
 
     // Overlay bboxes
     if (bbox_msg && frame) {
-        const float sx = static_cast<float>(m_cfg.display_width)
-                       / static_cast<float>(frame->width);
-        const float sy = static_cast<float>(m_cfg.display_height)
-                       / static_cast<float>(frame->height);
+        // Use actual logical render size for scaling so bbox coords map correctly
+        // whether display_width/height were configured or auto-detected.
+        int lw = 0, lh = 0;
+        SDL_RenderGetLogicalSize(m_renderer, &lw, &lh);
+        const float sx = static_cast<float>(lw) / static_cast<float>(frame->width);
+        const float sy = static_cast<float>(lh) / static_cast<float>(frame->height);
         draw_bboxes(*bbox_msg, sx, sy);
     }
 
@@ -231,6 +286,37 @@ bool DisplayOutput::present() {
             m_lat_min_us        = UINT64_MAX;
             m_lat_max_us        = 0;
             m_last_lat_print_us = now;
+        }
+    }
+
+    // ---- SEI in-band E2E latency (capture_ts embedded in H.264 SEI → display) ----
+    // Independent of ZMQ: the timestamp travels inside the RTP stream itself,
+    // so this measurement works even without a shared clock or ZMQ connectivity.
+    if (frame && frame->sei_capture_ts_us != 0) {
+        const uint64_t now = ds_realtime_us();
+        const uint64_t lat = now - frame->sei_capture_ts_us;
+        if (lat < 10'000'000ULL) {
+            m_sei_lat_sum_us += lat;
+            ++m_sei_lat_count;
+            if (lat < m_sei_lat_min_us) m_sei_lat_min_us = lat;
+            if (lat > m_sei_lat_max_us) m_sei_lat_max_us = lat;
+        }
+        const uint32_t interval_s = m_cfg.debug.stats_interval_s;
+        if (interval_s > 0 && m_sei_lat_count > 0 &&
+            now - m_sei_last_print_us >=
+                static_cast<uint64_t>(interval_s) * 1'000'000ULL) {
+            DS_INFO("[E2E-SEI capture→display]  avg=%.1f ms  min=%.1f ms"
+                    "  max=%.1f ms  samples=%" PRIu64 "\n",
+                    m_sei_lat_sum_us / 1000.0 /
+                        static_cast<double>(m_sei_lat_count),
+                    m_sei_lat_min_us / 1000.0,
+                    m_sei_lat_max_us / 1000.0,
+                    m_sei_lat_count);
+            m_sei_lat_sum_us    = 0;
+            m_sei_lat_count     = 0;
+            m_sei_lat_min_us    = UINT64_MAX;
+            m_sei_lat_max_us    = 0;
+            m_sei_last_print_us = now;
         }
     }
 

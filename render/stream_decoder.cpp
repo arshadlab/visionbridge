@@ -10,9 +10,93 @@
 #include <sstream>
 #include <cinttypes>
 #include <cstring>
+#include <vector>
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
+
+// ---------------------------------------------------------------------------
+// SEI extraction helpers
+// ---------------------------------------------------------------------------
+
+// Must match kVbSeiUUID in source/capture_pipeline.cpp
+static const uint8_t kVbSeiUUID[16] = {
+    0xB5, 0x58, 0x0A, 0xB2,  0x1C, 0x7D, 0x4E, 0xF6,
+    0x81, 0x93, 0xA4, 0xC3,  0xD7, 0xE5, 0xF2, 0x9B
+};
+
+// EBSP → RBSP: remove emulation-prevention bytes (00 00 03 → 00 00)
+static void ebsp_decode(const uint8_t* src, size_t len,
+                        std::vector<uint8_t>& out) {
+    out.clear();
+    out.reserve(len);
+    for (size_t i = 0; i < len; ) {
+        if (i + 2 < len &&
+            src[i] == 0x00 && src[i+1] == 0x00 && src[i+2] == 0x03) {
+            out.push_back(0x00);
+            out.push_back(0x00);
+            i += 3; // skip the 0x03 emulation-prevention byte
+        } else {
+            out.push_back(src[i++]);
+        }
+    }
+}
+
+// Scan an Annex-B byte-stream buffer for a VisionBridge SEI NAL.
+// Returns true and fills ts_out / seq_out when found.
+static bool sei_parse_nal(const uint8_t* data, size_t size,
+                           uint64_t& ts_out, uint64_t& seq_out) {
+    if (size < 39) return false;
+    for (size_t i = 0; i + 4 <= size; ) {
+        // Scan for Annex-B start code (4-byte preferred, 3-byte fallback)
+        if (data[i] == 0x00 && data[i+1] == 0x00) {
+            if (i + 3 < size && data[i+2] == 0x00 && data[i+3] == 0x01) {
+                i += 4;
+            } else if (data[i+2] == 0x01) {
+                i += 3;
+            } else { ++i; continue; }
+        } else { ++i; continue; }
+
+        if (i >= size) break;
+        const uint8_t nal_type = data[i] & 0x1F;
+        ++i;
+        if (nal_type != 6) continue; // not SEI
+
+        // Locate end of this NAL (next start code or end of buffer)
+        size_t nal_end = size;
+        for (size_t j = i; j + 2 < size; ++j) {
+            if (data[j] == 0x00 && data[j+1] == 0x00 &&
+                (data[j+2] == 0x01 ||
+                 (j + 3 < size && data[j+2] == 0x00 && data[j+3] == 0x01)))
+            { nal_end = j; break; }
+        }
+
+        // EBSP → RBSP
+        std::vector<uint8_t> rbsp;
+        ebsp_decode(data + i, nal_end - i, rbsp);
+
+        // Parse SEI messages in RBSP
+        size_t pos = 0;
+        while (pos < rbsp.size()) {
+            if (rbsp[pos] != 0x05) break; // only user_data_unregistered
+            ++pos;
+            size_t payload_size = 0;
+            while (pos < rbsp.size() && rbsp[pos] == 0xFF)
+                { payload_size += 255; ++pos; }
+            if (pos >= rbsp.size()) break;
+            payload_size += rbsp[pos++];
+
+            if (payload_size >= 32 && pos + payload_size <= rbsp.size() &&
+                std::memcmp(rbsp.data() + pos, kVbSeiUUID, 16) == 0) {
+                std::memcpy(&ts_out,  rbsp.data() + pos + 16, 8);
+                std::memcpy(&seq_out, rbsp.data() + pos + 24, 8);
+                return true;
+            }
+            pos += payload_size;
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 StreamDecoder::StreamDecoder(const DsRenderConfig& cfg) : m_cfg(cfg), m_hw_decode(cfg.codec.hw_decode) {}
@@ -45,7 +129,7 @@ std::string StreamDecoder::build_pipeline_str() const {
     // rtpjitterbuffer: minimal latency (20ms default) since source is live
     ss << " ! rtpjitterbuffer latency=" << m_cfg.jitter_buffer_ms
        << " drop-on-latency=true"
-       << " ! rtph264depay"
+       << " ! rtph264depay name=vdepay"
        << " ! h264parse name=vparser";
 
     if (m_hw_decode) {
@@ -56,9 +140,11 @@ std::string StreamDecoder::build_pipeline_str() const {
 
     ss << " ! videoconvert"
        << " ! video/x-raw,format=RGBA"
-       // sync=false: don't throttle to GStreamer clock; render as fast as possible
-       // drop=true + max-buffers=1: always show the newest decoded frame
-       << " ! appsink name=vsink sync=false max-buffers=1 drop=true emit-signals=true";
+       // decoder_sync=false: deliver frames as fast as decoded so bbox ZMQ and video stay
+       // in sync. Frame rate is capped in the render loop by display_fps config.
+       // decoder_sync=true: pace to GStreamer clock (accurate timing, may misalign bboxes).
+       << " ! appsink name=vsink sync=" << (m_cfg.decoder_sync ? "true" : "false")
+       << " max-buffers=1 drop=true emit-signals=true";
 
     return ss.str();
 }
@@ -104,6 +190,20 @@ GstFlowReturn StreamDecoder::on_new_sample(GstAppSink* sink, gpointer data) {
 
     gst_buffer_unmap(buf, &map);
     gst_sample_unref(sample);
+
+    // Stamp frame with SEI data matched by PTS (precise per-frame correlation)
+    if (GST_BUFFER_PTS_IS_VALID(buf)) {
+        const GstClockTime pts = GST_BUFFER_PTS(buf);
+        std::lock_guard<std::mutex> lk(self->m_sei_mtx);
+        for (auto& e : self->m_sei_map) {
+            if (e.pts == pts && e.capture_ts_us != 0) {
+                frame->sei_capture_ts_us = e.capture_ts_us;
+                frame->sei_frame_seq     = e.frame_seq;
+                e.capture_ts_us = 0; // consume
+                break;
+            }
+        }
+    }
 
     ++self->m_frames_decoded;
 
@@ -195,6 +295,45 @@ GstPadProbeReturn StreamDecoder::appsink_probe_cb(GstPad*, GstPadProbeInfo*,
     return GST_PAD_PROBE_OK;
 }
 
+// rtph264depay src pad — scan Annex-B output for a VisionBridge SEI NAL and cache result.
+// Fires before the buffer enters h264parse / vdec; the raw depacketized byte-stream
+// still contains the injected SEI.
+GstPadProbeReturn StreamDecoder::sei_extract_probe_cb(GstPad*, GstPadProbeInfo* info,
+                                                      gpointer udata) {
+    auto* self = static_cast<StreamDecoder*>(udata);
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf) return GST_PAD_PROBE_OK;
+
+    GstMapInfo map;
+    if (!gst_buffer_map(buf, &map, GST_MAP_READ))
+        return GST_PAD_PROBE_OK;
+
+    uint64_t ts = 0, seq = 0;
+    const bool found = sei_parse_nal(map.data, map.size, ts, seq);
+    gst_buffer_unmap(buf, &map);
+
+    if (found) {
+        if (!GST_BUFFER_PTS_IS_VALID(buf)) {
+            // No PTS — fall back to overwriting latest (best effort)
+            std::lock_guard<std::mutex> lk(self->m_sei_mtx);
+            self->m_sei_map[self->m_sei_map_head % kSeiMapSize] = {
+                GST_CLOCK_TIME_NONE, ts, seq };
+            ++self->m_sei_map_head;
+        } else {
+            const GstClockTime pts = GST_BUFFER_PTS(buf);
+            std::lock_guard<std::mutex> lk(self->m_sei_mtx);
+            auto& slot = self->m_sei_map[self->m_sei_map_head % kSeiMapSize];
+            slot.pts           = pts;
+            slot.capture_ts_us = ts;
+            slot.frame_seq     = seq;
+            ++self->m_sei_map_head;
+        }
+        DS_TRACE("StreamDecoder: SEI capture_ts=%" PRIu64 " seq=%" PRIu64 "\n",
+                 ts, seq);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 // ---------------------------------------------------------------------------
 // print_timing_stats (called by GLib timer)
 // ---------------------------------------------------------------------------
@@ -282,10 +421,28 @@ bool StreamDecoder::start() {
     cbs.new_sample = on_new_sample;
     gst_app_sink_set_callbacks(GST_APP_SINK(m_appsink), &cbs, this, nullptr);
 
+    // Attach SEI extract probe on h264parse src — at this point h264parse has
+    // assigned the final PTS that the decoder preserves through to the appsink,
+    // so PTS-keyed lookup in on_new_sample gives exact per-frame correlation.
+    // We always need h264parse, so grab it here regardless of stats.
+    if (!m_h264parse)
+        m_h264parse = gst_bin_get_by_name(GST_BIN(m_pipeline), "vparser");
+    if (m_h264parse) {
+        GstPad* src = gst_element_get_static_pad(m_h264parse, "src");
+        if (src) {
+            m_sei_extract_probe_id = gst_pad_add_probe(src,
+                GST_PAD_PROBE_TYPE_BUFFER, sei_extract_probe_cb, this, nullptr);
+            gst_object_unref(src);
+        }
+    } else {
+        DS_WARN("StreamDecoder: h264parse 'vparser' not found — SEI extraction disabled\n");
+    }
+
     // Attach timing probes
     if (m_cfg.debug.stats_interval_s > 0) {
-        m_h264parse = gst_bin_get_by_name(GST_BIN(m_pipeline), "vparser");
-        m_vdec      = gst_bin_get_by_name(GST_BIN(m_pipeline), "vdec");
+        if (!m_h264parse)
+            m_h264parse = gst_bin_get_by_name(GST_BIN(m_pipeline), "vparser");
+        m_vdec = gst_bin_get_by_name(GST_BIN(m_pipeline), "vdec");
 
         auto attach_probe = [](GstElement* elem, const char* pad_name,
                                GstPadProbeType type, GstPadProbeCallback cb,
@@ -343,6 +500,7 @@ void StreamDecoder::stop() {
             probe_id = 0;
         }
     };
+    remove_probe(m_h264parse, "src",  m_sei_extract_probe_id);
     remove_probe(m_h264parse, "src",  m_pre_dec_probe_id);
     remove_probe(m_vdec,      "sink", m_vdec_sink_probe_id);
     remove_probe(m_vdec,      "src",  m_vdec_src_probe_id);
@@ -354,6 +512,7 @@ void StreamDecoder::stop() {
     if (m_loop) g_main_loop_quit(m_loop);
     if (m_gst_thread.joinable()) m_gst_thread.join();
 
+    if (m_vdepay)    { gst_object_unref(m_vdepay);    m_vdepay    = nullptr; }
     if (m_h264parse) { gst_object_unref(m_h264parse); m_h264parse = nullptr; }
     if (m_vdec)      { gst_object_unref(m_vdec);      m_vdec      = nullptr; }
     if (m_appsink)   { gst_object_unref(m_appsink);   m_appsink   = nullptr; }

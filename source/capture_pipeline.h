@@ -100,9 +100,10 @@ private:
     static gboolean        bus_callback (GstBus* bus, GstMessage* msg, gpointer data);
 
     // ---- Pad probe callbacks (all return GST_PAD_PROBE_OK) ----
-    static GstPadProbeReturn enc_sink_probe_cb(GstPad*, GstPadProbeInfo*, gpointer);
-    static GstPadProbeReturn enc_src_probe_cb (GstPad*, GstPadProbeInfo*, gpointer);
-    static GstPadProbeReturn pay_src_probe_cb (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn enc_sink_probe_cb   (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn enc_src_probe_cb    (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn pay_src_probe_cb    (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn sei_inject_probe_cb (GstPad*, GstPadProbeInfo*, gpointer);
 
     // ---- GLib main loop thread ----
     void gst_thread_func();
@@ -115,18 +116,20 @@ private:
     std::vector<std::unique_ptr<ITracker>> m_trackers;
     BboxCallback m_bbox_cb;
 
-    GstElement* m_pipeline  = nullptr;
-    GstElement* m_appsink   = nullptr;
-    GstElement* m_encoder   = nullptr; ///< "venc" (x264enc or vaapih264enc)
+    GstElement* m_pipeline   = nullptr;
+    GstElement* m_appsink    = nullptr;
+    GstElement* m_encoder    = nullptr; ///< "venc" (x264enc or vaapih264enc)
+    GstElement* m_h264parse  = nullptr; ///< "vsparse" (source h264parse, SEI inject)
     GstElement* m_rtph264pay = nullptr; ///< "vpay"
-    GMainLoop*  m_loop      = nullptr;
+    GMainLoop*  m_loop       = nullptr;
     std::thread m_gst_thread;
 
     // Probe IDs (removed before GST_STATE_NULL)
-    gulong m_enc_sink_probe_id = 0;
-    gulong m_enc_src_probe_id  = 0;
-    gulong m_pay_src_probe_id  = 0;
-    guint  m_timing_timer_id   = 0;
+    gulong m_enc_sink_probe_id   = 0;
+    gulong m_enc_src_probe_id    = 0;
+    gulong m_pay_src_probe_id    = 0;
+    gulong m_sei_inject_probe_id = 0; ///< SEI timestamp inject on h264parse src
+    guint  m_timing_timer_id     = 0;
 
     std::atomic<bool>    m_running{false};
     std::atomic<uint64_t> m_frame_seq{0};
@@ -140,6 +143,19 @@ private:
     // Per-tracker latency stats; indexed by tracker position in m_trackers
     static constexpr int kMaxTrackers = 4;
     LatencyStats        m_tracker_stats[kMaxTrackers];
+
+    // ---- SEI PTS correlation map (protected by m_sei_map_mtx) ----
+    // Written from the appsink callback; consumed by sei_inject_probe_cb.
+    // Ring buffer large enough for any encode in-flight depth.
+    struct SeiMapEntry {
+        GstClockTime pts           = GST_CLOCK_TIME_NONE;
+        uint64_t     capture_ts_us = 0; ///< 0 = empty slot
+        uint64_t     frame_seq     = 0;
+    };
+    static constexpr int kSeiMapSize = 16;
+    SeiMapEntry         m_sei_map[kSeiMapSize]{};
+    size_t              m_sei_map_head = 0;
+    mutable std::mutex  m_sei_map_mtx;
 };
 
 #endif // VISIONBRIDGE_CAPTURE_PIPELINE_H

@@ -27,6 +27,10 @@ struct DecodedFrame {
     uint32_t             stride = 0;   ///< bytes per row
     std::vector<uint8_t> data;         ///< RGBA packed, row-major
 
+    // In-band E2E: extracted from the H.264 SEI NAL injected at source (0 = absent)
+    uint64_t sei_capture_ts_us = 0; ///< CLOCK_REALTIME at source appsink entry (µs)
+    uint64_t sei_frame_seq     = 0; ///< source frame counter
+
     size_t data_bytes() const { return static_cast<size_t>(stride) * height; }
 };
 
@@ -84,10 +88,12 @@ private:
     static gboolean        bus_callback        (GstBus*, GstMessage*, gpointer);
 
     // Timing probes (registered only when stats_interval_s > 0)
-    static GstPadProbeReturn pre_dec_probe_cb  (GstPad*, GstPadProbeInfo*, gpointer);
-    static GstPadProbeReturn vdec_sink_probe_cb(GstPad*, GstPadProbeInfo*, gpointer);
-    static GstPadProbeReturn vdec_src_probe_cb (GstPad*, GstPadProbeInfo*, gpointer);
-    static GstPadProbeReturn appsink_probe_cb  (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn pre_dec_probe_cb    (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn vdec_sink_probe_cb  (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn vdec_src_probe_cb   (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn appsink_probe_cb    (GstPad*, GstPadProbeInfo*, gpointer);
+    // SEI extract probe (always registered — not stats-gated)
+    static GstPadProbeReturn sei_extract_probe_cb(GstPad*, GstPadProbeInfo*, gpointer);
 
     void gst_thread_func();
     void print_timing_stats();
@@ -98,16 +104,30 @@ private:
 
     GstElement* m_pipeline  = nullptr;
     GstElement* m_appsink   = nullptr;
+    GstElement* m_vdepay    = nullptr; ///< "vdepay" rtph264depay (SEI extract)
     GstElement* m_h264parse = nullptr; ///< "vparser"
     GstElement* m_vdec      = nullptr; ///< "vdec"
     GMainLoop*  m_loop      = nullptr;
     std::thread m_gst_thread;
 
-    gulong m_pre_dec_probe_id   = 0;
-    gulong m_vdec_sink_probe_id = 0;
-    gulong m_vdec_src_probe_id  = 0;
-    gulong m_appsink_probe_id   = 0;
-    guint  m_timing_timer_id    = 0;
+    gulong m_pre_dec_probe_id     = 0;
+    gulong m_vdec_sink_probe_id   = 0;
+    gulong m_vdec_src_probe_id    = 0;
+    gulong m_appsink_probe_id     = 0;
+    gulong m_sei_extract_probe_id = 0; ///< SEI extract on vdepay src (always)
+    guint  m_timing_timer_id      = 0;
+
+    // SEI PTS correlation map (written by sei_extract_probe_cb, read by on_new_sample).
+    // Keyed by GstBuffer PTS so that concurrent in-flight frames map correctly.
+    struct SeiMapEntry {
+        GstClockTime pts           = GST_CLOCK_TIME_NONE;
+        uint64_t     capture_ts_us = 0; ///< 0 = empty slot
+        uint64_t     frame_seq     = 0;
+    };
+    static constexpr int kSeiMapSize = 16;
+    SeiMapEntry         m_sei_map[kSeiMapSize]{};
+    size_t              m_sei_map_head = 0;
+    mutable std::mutex  m_sei_mtx;
 
     std::atomic<bool>     m_running{false};
     std::atomic<uint64_t> m_frames_decoded{0};

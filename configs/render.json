@@ -10,9 +10,9 @@
     },
 
     "codec": {
-        "bitrate_kbps": 4000,
+        "bitrate_kbps": 9000,
         "keyint":       1,
-        "hw_encode":    false,
+        "hw_encode":    true,
         "hw_decode":    false
     },
 
@@ -22,10 +22,12 @@
     },
 
     "jitter_buffer_ms": 20,
+    "decoder_sync":     false,
 
     "display": {
-        "width":             1280,
-        "height":            720,
+        "width":             0,
+        "height":            0,
+        "fps":               30,
         "title":             "VisionBridge",
         "fullscreen":        false,
         "sdl_display_index": -1

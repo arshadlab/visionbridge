@@ -74,9 +74,9 @@ bool ConfigLoader::load_source(const std::string& path, DsSourceConfig& out) {
             out.input.type    = jget<std::string>(i, "type",   "webcam");
             out.input.device  = jget<std::string>(i, "device", "/dev/video0");
             out.input.file    = jget<std::string>(i, "file",   "");
-            out.input.width   = jget<uint32_t>   (i, "width",  1280);
-            out.input.height  = jget<uint32_t>   (i, "height", 720);
-            out.input.fps_num = jget<uint32_t>   (i, "fps_num", 30);
+            out.input.width   = jget<uint32_t>   (i, "width",   0);
+            out.input.height  = jget<uint32_t>   (i, "height",  0);
+            out.input.fps_num = jget<uint32_t>   (i, "fps_num", 0);
             out.input.fps_den = jget<uint32_t>   (i, "fps_den", 1);
             out.input.loop    = jget<bool>        (i, "loop",   true);
         }
@@ -146,12 +146,12 @@ bool ConfigLoader::load_render(const std::string& path, DsRenderConfig& out) {
         if (j.contains("zmq"))       out.zmq       = parse_zmq      (j.at("zmq"));
         if (j.contains("debug"))     out.debug     = parse_debug    (j.at("debug"));
 
-        out.jitter_buffer_ms = jget<uint32_t>(j, "jitter_buffer_ms", 20);
-
+        out.jitter_buffer_ms = jget<uint32_t>(j, "jitter_buffer_ms", 20);        out.decoder_sync        = jget<bool>    (j, "decoder_sync",     false);
         if (j.contains("display")) {
             const auto& d = j.at("display");
-            out.display_width      = jget<uint32_t>   (d, "width",             1280);
-            out.display_height     = jget<uint32_t>   (d, "height",            720);
+            out.display_width      = jget<uint32_t>   (d, "width",             0);
+            out.display_height     = jget<uint32_t>   (d, "height",            0);
+            out.display_fps        = jget<uint32_t>   (d, "fps",               30);
             out.display_title      = jget<std::string>(d, "title",
                                                        "VisionBridge");
             out.fullscreen         = jget<bool>       (d, "fullscreen",        false);

@@ -17,9 +17,9 @@ struct InputConfig {
     std::string type   = "webcam"; ///< "webcam" | "file"
     std::string device = "/dev/video0"; ///< V4L2 device path (webcam mode)
     std::string file;               ///< Video file path (file mode)
-    uint32_t    width  = 1280;
-    uint32_t    height = 720;
-    uint32_t    fps_num = 30;
+    uint32_t    width  = 0;   ///< 0 = use native input resolution
+    uint32_t    height = 0;   ///< 0 = use native input resolution
+    uint32_t    fps_num = 0;  ///< 0 = use native input frame rate
     uint32_t    fps_den = 1;
     bool        loop   = true;      ///< Loop file input when EOS is reached
 };
@@ -115,10 +115,12 @@ struct DsRenderConfig {
     DsDebugConfig     debug;
 
     uint32_t jitter_buffer_ms = 20;  ///< RTP jitter buffer (ms) — low for live
+    bool     decoder_sync     = false; ///< appsink sync: false=free-run (bbox aligned), true=clock-paced
 
     // Display
-    uint32_t    display_width  = 1280;
-    uint32_t    display_height = 720;
+    uint32_t    display_width  = 0;   ///< 0 = match decoded frame width
+    uint32_t    display_height = 0;   ///< 0 = match decoded frame height
+    uint32_t    display_fps    = 30;  ///< max render rate; caps file-playback speed
     std::string display_title  = "VisionBridge";
     bool        fullscreen     = false;
     int         sdl_display_index = -1; ///< -1 = primary display

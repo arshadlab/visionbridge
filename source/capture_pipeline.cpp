@@ -10,10 +10,58 @@
 #include <sstream>
 #include <cinttypes>
 #include <cstring>
+#include <vector>
 #include <opencv2/core.hpp>
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
+
+// ---------------------------------------------------------------------------
+// SEI injection helpers
+// ---------------------------------------------------------------------------
+
+// VisionBridge SEI UUID (H.264 user_data_unregistered, payloadType=5).
+// All bytes non-zero to minimise EBSP emulation-prevention insertions.
+// Must match kVbSeiUUID in render/stream_decoder.cpp.
+static const uint8_t kVbSeiUUID[16] = {
+    0xB5, 0x58, 0x0A, 0xB2,  0x1C, 0x7D, 0x4E, 0xF6,
+    0x81, 0x93, 0xA4, 0xC3,  0xD7, 0xE5, 0xF2, 0x9B
+};
+
+// Build an Annex-B SEI NAL carrying {capture_ts_us, frame_seq}.
+// Wire layout: [00 00 00 01][06] EBSP{ 05 20 <UUID 16B> <ts 8B LE> <seq 8B LE> 80 }
+static std::vector<uint8_t> sei_build_nal(uint64_t capture_ts_us,
+                                          uint64_t frame_seq) {
+    // Raw RBSP (before EBSP encoding):
+    //   payloadType(1) + payloadSize(1) + UUID(16) + ts(8) + seq(8) + stop_bit(1) = 35
+    uint8_t rbsp[35];
+    rbsp[0] = 0x05;                          // user_data_unregistered
+    rbsp[1] = 0x20;                          // payload size = 32 bytes
+    std::memcpy(rbsp +  2, kVbSeiUUID,     16);
+    std::memcpy(rbsp + 18, &capture_ts_us,  8);
+    std::memcpy(rbsp + 26, &frame_seq,      8);
+    rbsp[34] = 0x80;                         // RBSP trailing stop bit
+
+    // EBSP encode: insert 0x03 after any "00 00" preceding 0x00–0x03
+    std::vector<uint8_t> ebsp;
+    ebsp.reserve(40);
+    int zeros = 0;
+    for (int i = 0; i < 35; ++i) {
+        if (zeros == 2 && rbsp[i] <= 0x03)
+            { ebsp.push_back(0x03); zeros = 0; }
+        ebsp.push_back(rbsp[i]);
+        zeros = (rbsp[i] == 0x00) ? zeros + 1 : 0;
+    }
+
+    // Prepend Annex-B start code + SEI NAL header (nal_unit_type=6)
+    std::vector<uint8_t> nal;
+    nal.reserve(5 + ebsp.size());
+    nal.push_back(0x00); nal.push_back(0x00);
+    nal.push_back(0x00); nal.push_back(0x01);
+    nal.push_back(0x06);
+    nal.insert(nal.end(), ebsp.begin(), ebsp.end());
+    return nal;
+}
 
 // ---------------------------------------------------------------------------
 // Construction / destruction
@@ -48,15 +96,18 @@ std::string CapturePipeline::build_pipeline_str() const {
     }
 
     // ----- Common format conversion & scaling -----
-    ss << " ! videoconvert"
-       << " ! videoscale"
-       << " ! videorate"
-       // BGRx: 4-byte-aligned BGR (OpenCV can use directly without copy)
-       << " ! video/x-raw,format=BGRx"
-       << ",width="     << in.width
-       << ",height="    << in.height
-       << ",framerate=" << in.fps_num << "/" << in.fps_den
-       << " ! tee name=t";
+    // Only insert videoscale/videorate when an override is actually requested.
+    ss << " ! videoconvert";
+    if (in.width > 0 || in.height > 0)
+        ss << " ! videoscale";
+    if (in.fps_num > 0)
+        ss << " ! videorate";
+    // BGRx: 4-byte-aligned BGR (OpenCV can use directly without copy)
+    ss << " ! video/x-raw,format=BGRx";
+    if (in.width  > 0) ss << ",width="  << in.width;
+    if (in.height > 0) ss << ",height=" << in.height;
+    if (in.fps_num > 0) ss << ",framerate=" << in.fps_num << "/" << in.fps_den;
+    ss << " ! tee name=t";
 
     // ----- Tracker/appsink branch -----
     // leaky=downstream: if appsink is busy (tracker running), drop the incoming
@@ -94,7 +145,7 @@ std::string CapturePipeline::build_pipeline_str() const {
 
     // config-interval=-1 → inject SPS/PPS before every IDR
     // ssrc fixed → receiver treats all pipeline instances as the same sender
-    ss << " ! h264parse"
+    ss << " ! h264parse name=vsparse"
        << " ! rtph264pay name=vpay config-interval=-1"
           " ssrc=987654321 pt=96 mtu=1400";
 
@@ -171,6 +222,17 @@ GstFlowReturn CapturePipeline::on_new_sample(GstAppSink* sink, gpointer data) {
     msg.capture_ts_us    = capture_ts;  // set at callback entry — before tracker cost
     msg.send_ts_us       = 0;           // filled just before ZMQ send
     msg.bbox_count       = 0;
+
+    // Store PTS → {capture_ts, frame_seq} so sei_inject_probe_cb can embed them
+    // into the corresponding encoded H.264 frame on the encoder branch.
+    if (GST_BUFFER_PTS_IS_VALID(buf)) {
+        std::lock_guard<std::mutex> lk(self->m_sei_map_mtx);
+        auto& slot = self->m_sei_map[self->m_sei_map_head % 16];
+        slot.pts           = GST_BUFFER_PTS(buf);
+        slot.capture_ts_us = capture_ts;
+        slot.frame_seq     = msg.frame_seq;
+        ++self->m_sei_map_head;
+    }
 
     const uint32_t stats_en = self->m_cfg.debug.stats_interval_s;
 
@@ -303,6 +365,63 @@ GstPadProbeReturn CapturePipeline::pay_src_probe_cb(GstPad*, GstPadProbeInfo* in
     return GST_PAD_PROBE_OK;
 }
 
+// h264parse src pad — prepend a VisionBridge SEI NAL carrying {capture_ts_us, frame_seq}.
+// The SEI rides through RTP/UDP unchanged and is extracted by sei_extract_probe_cb on
+// the render side, enabling in-band E2E latency measurement without a shared clock.
+GstPadProbeReturn CapturePipeline::sei_inject_probe_cb(GstPad*, GstPadProbeInfo* info,
+                                                       gpointer udata) {
+    GstBuffer* orig = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!orig || GST_BUFFER_FLAG_IS_SET(orig, GST_BUFFER_FLAG_HEADER))
+        return GST_PAD_PROBE_OK; // skip codec header (SPS/PPS) buffers
+    if (!GST_BUFFER_PTS_IS_VALID(orig))
+        return GST_PAD_PROBE_OK;
+
+    auto* self = static_cast<CapturePipeline*>(udata);
+    const GstClockTime pts = GST_BUFFER_PTS(orig);
+
+    // Look up the capture timestamp recorded in the appsink callback for this PTS
+    uint64_t capture_ts = 0, frame_seq = 0;
+    {
+        std::lock_guard<std::mutex> lk(self->m_sei_map_mtx);
+        for (auto& e : self->m_sei_map) {
+            if (e.pts == pts && e.capture_ts_us != 0) {
+                capture_ts      = e.capture_ts_us;
+                frame_seq       = e.frame_seq;
+                e.capture_ts_us = 0; // consumed
+                break;
+            }
+        }
+    }
+    if (capture_ts == 0)
+        return GST_PAD_PROBE_OK; // no mapping for this PTS
+
+    const auto sei_bytes = sei_build_nal(capture_ts, frame_seq);
+
+    // Build combined buffer: [SEI NAL bytes] followed by [original H.264 NAL(s)]
+    GstMapInfo omap;
+    if (!gst_buffer_map(orig, &omap, GST_MAP_READ))
+        return GST_PAD_PROBE_OK;
+
+    const gsize total = sei_bytes.size() + omap.size;
+    GstBuffer* new_buf = gst_buffer_new_and_alloc(total);
+    GstMapInfo nmap;
+    gst_buffer_map(new_buf, &nmap, GST_MAP_WRITE);
+    std::memcpy(nmap.data,                    sei_bytes.data(), sei_bytes.size());
+    std::memcpy(nmap.data + sei_bytes.size(), omap.data,        omap.size);
+    gst_buffer_unmap(new_buf, &nmap);
+    gst_buffer_unmap(orig,    &omap);
+
+    // Copy timestamps and flags from original buffer
+    gst_buffer_copy_into(new_buf, orig,
+        static_cast<GstBufferCopyFlags>(GST_BUFFER_COPY_FLAGS |
+                                        GST_BUFFER_COPY_TIMESTAMPS), 0, -1);
+
+    // Replace buffer in probe info (release original's ref, hand new_buf ref to probe)
+    gst_buffer_unref(orig);
+    GST_PAD_PROBE_INFO_DATA(info) = new_buf;
+    return GST_PAD_PROBE_OK;
+}
+
 // ---------------------------------------------------------------------------
 // print_timing_stats — called by 1-second GLib timer
 // ---------------------------------------------------------------------------
@@ -387,6 +506,19 @@ bool CapturePipeline::start() {
     cbs.new_sample = on_new_sample;
     gst_app_sink_set_callbacks(GST_APP_SINK(m_appsink), &cbs, this, nullptr);
 
+    // Attach SEI inject probe unconditionally — in-band E2E timestamp embed
+    m_h264parse = gst_bin_get_by_name(GST_BIN(m_pipeline), "vsparse");
+    if (m_h264parse) {
+        GstPad* src = gst_element_get_static_pad(m_h264parse, "src");
+        if (src) {
+            m_sei_inject_probe_id = gst_pad_add_probe(src,
+                GST_PAD_PROBE_TYPE_BUFFER, sei_inject_probe_cb, this, nullptr);
+            gst_object_unref(src);
+        }
+    } else {
+        DS_WARN("CapturePipeline: h264parse 'vsparse' not found — SEI injection disabled\n");
+    }
+
     // Attach timing probes only when stats are enabled
     if (m_cfg.debug.stats_interval_s > 0) {
         m_encoder   = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
@@ -457,6 +589,7 @@ void CapturePipeline::stop() {
             probe_id = 0;
         }
     };
+    remove_probe(m_h264parse,  "src",  m_sei_inject_probe_id);
     remove_probe(m_encoder,    "sink", m_enc_sink_probe_id);
     remove_probe(m_encoder,    "src",  m_enc_src_probe_id);
     remove_probe(m_rtph264pay, "src",  m_pay_src_probe_id);
@@ -471,6 +604,7 @@ void CapturePipeline::stop() {
     if (m_loop) g_main_loop_quit(m_loop);
     if (m_gst_thread.joinable()) m_gst_thread.join();
 
+    if (m_h264parse)  { gst_object_unref(m_h264parse);  m_h264parse  = nullptr; }
     if (m_encoder)    { gst_object_unref(m_encoder);    m_encoder    = nullptr; }
     if (m_rtph264pay) { gst_object_unref(m_rtph264pay); m_rtph264pay = nullptr; }
     if (m_appsink)    { gst_object_unref(m_appsink);    m_appsink    = nullptr; }

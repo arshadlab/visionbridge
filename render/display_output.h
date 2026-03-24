@@ -6,7 +6,7 @@
  *
  *  ┌──────────────────────────────────────────────────┐
  *  │  StreamDecoder ──▶  update_frame()               │
- *  │  ZMQ PULL thread ──▶ m_latest_msg (atomic-swap)  │
+ *  │  ZMQ PULL thread ──▶ m_bbox_ring (by frame_seq)  │
  *  │  caller calls present() from its render loop     │
  *  └──────────────────────────────────────────────────┘
  */
@@ -51,15 +51,23 @@ private:
 
     uint32_t m_tex_width  = 0;
     uint32_t m_tex_height = 0;
+    bool     m_window_sized = false; ///< false until window resized to first frame
 
     // Latest decoded frame (written from decoder thread, read on main thread)
     std::shared_ptr<DecodedFrame> m_pending_frame;
     std::mutex m_frame_mtx;
 
-    // Latest bbox message (written from ZMQ thread, read on main thread)
-    // Use a shared_ptr swapped under m_bbox_mtx for minimal main-thread stall.
-    std::shared_ptr<DsMsgBbox> m_latest_bbox;
-    std::mutex m_bbox_mtx;
+    // Bbox ring buffer — keyed by frame_seq for per-frame correlation.
+    // zmq_recv_loop() writes here; present() looks up by sei_frame_seq with
+    // fallback to the most-recently-received entry when SEI is unavailable.
+    static constexpr int kBboxRingSize = 8;
+    struct BboxRingEntry {
+        uint64_t                   frame_seq = 0;
+        std::shared_ptr<DsMsgBbox> msg;
+    };
+    BboxRingEntry m_bbox_ring[kBboxRingSize]{};
+    size_t        m_bbox_ring_head = 0;
+    std::mutex    m_bbox_mtx;
 
     // ZMQ
     void*       m_zmq_ctx    = nullptr;
@@ -71,13 +79,24 @@ private:
 
     void draw_bboxes(const DsMsgBbox& msg, float sx, float sy);
 
-    // End-to-end latency stats (capture_ts_us → SDL_RenderPresent).
+    // Frame rate throttle: cap present() to display_fps to prevent file over-speed.
+    // Touched only on the main thread — no mutex needed.
+    uint64_t m_last_present_us   = 0;
+
+    // End-to-end latency stats — ZMQ path (capture_ts_us → SDL_RenderPresent).
     // All fields touched only on the main thread inside present() — no mutex needed.
     uint64_t m_lat_sum_us        = 0;
     uint64_t m_lat_count         = 0;
     uint64_t m_lat_min_us        = UINT64_MAX;
     uint64_t m_lat_max_us        = 0;
     uint64_t m_last_lat_print_us = 0;
+
+    // End-to-end latency stats — SEI in-band path (sei_capture_ts_us → SDL_RenderPresent).
+    uint64_t m_sei_lat_sum_us    = 0;
+    uint64_t m_sei_lat_count     = 0;
+    uint64_t m_sei_lat_min_us    = UINT64_MAX;
+    uint64_t m_sei_lat_max_us    = 0;
+    uint64_t m_sei_last_print_us = 0;
 
     const DsRenderConfig& m_cfg;
 };

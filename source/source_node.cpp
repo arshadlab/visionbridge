@@ -89,14 +89,25 @@ bool SourceNode::init() {
     int timeout_ms = 0;
     zmq_setsockopt(m_zmq_push, ZMQ_SNDTIMEO, &timeout_ms, sizeof(timeout_ms));
 
-    const std::string& ep = m_cfg.zmq.source_endpoint;
-    if (zmq_bind(m_zmq_push, ep.c_str()) != 0) {
-        DS_ERR("SourceNode: zmq_bind(%s) failed: %s\n",
-               ep.c_str(), zmq_strerror(zmq_errno()));
-        return false;
+    if (m_cfg.transport.multicast) {
+        // Multicast: bind — render PULL connects to us
+        const std::string& ep = m_cfg.zmq.source_endpoint;
+        if (zmq_bind(m_zmq_push, ep.c_str()) != 0) {
+            DS_ERR("SourceNode: zmq_bind(%s) failed: %s\n",
+                   ep.c_str(), zmq_strerror(zmq_errno()));
+            return false;
+        }
+        DS_INFO("SourceNode: ZMQ PUSH bound to %s\n", ep.c_str());
+    } else {
+        // Unicast: connect to render — render PULL binds
+        const std::string& ep = m_cfg.zmq.render_endpoint;
+        if (zmq_connect(m_zmq_push, ep.c_str()) != 0) {
+            DS_ERR("SourceNode: zmq_connect(%s) failed: %s\n",
+                   ep.c_str(), zmq_strerror(zmq_errno()));
+            return false;
+        }
+        DS_INFO("SourceNode: ZMQ PUSH connected to %s\n", ep.c_str());
     }
-
-    DS_INFO("SourceNode: ZMQ PUSH bound to %s\n", ep.c_str());
     return true;
 }
 

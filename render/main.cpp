@@ -117,22 +117,25 @@ int main(int argc, char* argv[]) {
     if (!unicast_host.empty()) {
         cfg.transport.host      = unicast_host;
         cfg.transport.multicast = false;
-        cfg.zmq.render_endpoint = replace_endpoint_host(cfg.zmq.render_endpoint, unicast_host);
-        DS_INFO("Transport override: UNICAST host=%s, zmq=%s\n",
-                cfg.transport.host.c_str(), cfg.zmq.render_endpoint.c_str());
+        // Unicast: render PULL binds (source PUSH connects); no render_endpoint update needed
+        DS_INFO("Transport override: UNICAST host=%s, zmq bind=%s\n",
+                cfg.transport.host.c_str(), cfg.zmq.source_endpoint.c_str());
     } else if (!multicast_group.empty()) {
         cfg.transport.host      = multicast_group;
         cfg.transport.multicast = true;
         cfg.zmq.render_endpoint = replace_endpoint_host(cfg.zmq.render_endpoint, multicast_group);
-        DS_INFO("Transport override: MULTICAST group=%s, zmq=%s\n",
+        DS_INFO("Transport override: MULTICAST group=%s, zmq connect=%s\n",
                 cfg.transport.host.c_str(), cfg.zmq.render_endpoint.c_str());
     } else if (!source_host.empty()) {
         cfg.transport.host      = source_host;
         cfg.transport.multicast = is_multicast_addr(source_host);
-        cfg.zmq.render_endpoint = replace_endpoint_host(cfg.zmq.render_endpoint, source_host);
-        DS_INFO("Source override: %s host=%s, zmq=%s\n",
+        if (cfg.transport.multicast)
+            cfg.zmq.render_endpoint = replace_endpoint_host(cfg.zmq.render_endpoint, source_host);
+        DS_INFO("Source override: %s host=%s, zmq %s=%s\n",
                 cfg.transport.multicast ? "MULTICAST" : "UNICAST",
-                cfg.transport.host.c_str(), cfg.zmq.render_endpoint.c_str());
+                cfg.transport.host.c_str(),
+                cfg.transport.multicast ? "connect" : "bind",
+                cfg.transport.multicast ? cfg.zmq.render_endpoint.c_str() : cfg.zmq.source_endpoint.c_str());
     }
 
     // Override log level from config if CLI didn't set it
@@ -142,7 +145,9 @@ int main(int argc, char* argv[]) {
     DS_INFO("  transport: %s %s:%u\n",
             cfg.transport.multicast ? "[MULTICAST]" : "[UNICAST]",
             cfg.transport.host.c_str(), cfg.transport.rtp_port);
-    DS_INFO("  zmq pull:  %s\n", cfg.zmq.render_endpoint.c_str());
+    DS_INFO("  zmq pull:  %s (%s)\n",
+            cfg.transport.multicast ? cfg.zmq.render_endpoint.c_str() : cfg.zmq.source_endpoint.c_str(),
+            cfg.transport.multicast ? "connect" : "bind");
     DS_INFO("  jitter:    %u ms\n", cfg.jitter_buffer_ms);
     DS_INFO("  hw_decode: %s\n", cfg.codec.hw_decode ? "yes" : "no");
 

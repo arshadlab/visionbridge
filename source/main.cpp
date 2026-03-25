@@ -28,6 +28,16 @@ static void signal_handler(int sig) {
     if (g_node) g_node->request_stop();
 }
 
+// Replace host in a ZMQ endpoint such as tcp://1.2.3.4:5560
+static std::string replace_endpoint_host(const std::string& ep, const std::string& new_host) {
+    const auto scheme_end = ep.find("://");
+    if (scheme_end == std::string::npos) return ep;
+    const auto host_start = scheme_end + 3;
+    const auto colon_pos  = ep.find(':', host_start);
+    if (colon_pos == std::string::npos) return ep;
+    return ep.substr(0, host_start) + new_host + ep.substr(colon_pos);
+}
+
 static void print_usage(const char* prog) {
     printf("VisionBridge Source Node\n");
     printf("Usage: %s [options]\n\n", prog);
@@ -130,8 +140,11 @@ int main(int argc, char* argv[]) {
     if (dest_set) {
         cfg.transport.host      = dest_host;
         cfg.transport.multicast = false;
-        DS_INFO("Transport override: UNICAST dest=%s:%u\n",
-                cfg.transport.host.c_str(), cfg.transport.rtp_port);
+        // Unicast: source PUSH will connect to render; update render_endpoint host
+        cfg.zmq.render_endpoint = replace_endpoint_host(cfg.zmq.render_endpoint, dest_host);
+        DS_INFO("Transport override: UNICAST dest=%s:%u, zmq connect=%s\n",
+                cfg.transport.host.c_str(), cfg.transport.rtp_port,
+                cfg.zmq.render_endpoint.c_str());
     } else if (mcast_set) {
         cfg.transport.host      = mcast_group;
         cfg.transport.multicast = true;
@@ -148,7 +161,9 @@ int main(int argc, char* argv[]) {
     DS_INFO("  transport: %s %s:%u\n",
             cfg.transport.multicast ? "[MULTICAST]" : "[UNICAST]",
             cfg.transport.host.c_str(), cfg.transport.rtp_port);
-    DS_INFO("  zmq push:  %s\n", cfg.zmq.source_endpoint.c_str());
+    DS_INFO("  zmq push:  %s (%s)\n",
+            cfg.transport.multicast ? cfg.zmq.source_endpoint.c_str() : cfg.zmq.render_endpoint.c_str(),
+            cfg.transport.multicast ? "bind" : "connect");
 
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);

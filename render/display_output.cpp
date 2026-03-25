@@ -81,12 +81,23 @@ bool DisplayOutput::init() {
     int rcvtimeo = 100; // ms — allows graceful shutdown check
     zmq_setsockopt(m_zmq_socket, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
 
-    const std::string ep = m_cfg.zmq.render_endpoint;
-    if (zmq_connect(m_zmq_socket, ep.c_str()) != 0) {
-        DS_ERR("ZMQ connect to %s failed: %s\n", ep.c_str(), zmq_strerror(zmq_errno()));
-        return false;
+    if (m_cfg.transport.multicast) {
+        // Multicast: connect to source bind address
+        const std::string ep = m_cfg.zmq.render_endpoint;
+        if (zmq_connect(m_zmq_socket, ep.c_str()) != 0) {
+            DS_ERR("ZMQ connect to %s failed: %s\n", ep.c_str(), zmq_strerror(zmq_errno()));
+            return false;
+        }
+        DS_INFO("DisplayOutput: ZMQ PULL connected to %s\n", ep.c_str());
+    } else {
+        // Unicast: source PUSH connects to us; bind here
+        const std::string ep = m_cfg.zmq.source_endpoint;
+        if (zmq_bind(m_zmq_socket, ep.c_str()) != 0) {
+            DS_ERR("ZMQ bind to %s failed: %s\n", ep.c_str(), zmq_strerror(zmq_errno()));
+            return false;
+        }
+        DS_INFO("DisplayOutput: ZMQ PULL bound to %s\n", ep.c_str());
     }
-    DS_INFO("DisplayOutput: ZMQ PULL connected to %s\n", ep.c_str());
 
     m_running.store(true);
     m_zmq_thread = std::thread(&DisplayOutput::zmq_recv_loop, this);
@@ -261,62 +272,83 @@ bool DisplayOutput::present() {
     // capture_ts_us was stamped at the moment the frame entered the source appsink
     // callback.  We measure it here, right after SDL_RenderPresent(), which is the
     // earliest point the frame is committed to the display.
+    // Requires CLOCK_REALTIME to be synchronised between source and render (NTP/PTP).
     if (bbox_msg && bbox_msg->capture_ts_us != 0) {
         const uint64_t now = ds_realtime_us();
-        const uint64_t lat = now - bbox_msg->capture_ts_us;
-        // Guard against implausible values (clock step, unsynced clocks > 10 s, etc.)
-        if (lat < 10'000'000ULL) {
-            m_lat_sum_us += lat;
-            ++m_lat_count;
-            if (lat < m_lat_min_us) m_lat_min_us = lat;
-            if (lat > m_lat_max_us) m_lat_max_us = lat;
-        }
-        const uint32_t interval_s = m_cfg.debug.stats_interval_s;
-        if (interval_s > 0 && m_lat_count > 0 &&
-            now - m_last_lat_print_us >= static_cast<uint64_t>(interval_s) * 1'000'000ULL) {
-            DS_INFO("[E2E latency capture→display]  avg=%.1f ms  min=%.1f ms  max=%.1f ms"
-                    "  samples=%" PRIu64 "\n",
-                    m_lat_sum_us / 1000.0 / static_cast<double>(m_lat_count),
-                    m_lat_min_us / 1000.0,
-                    m_lat_max_us / 1000.0,
-                    m_lat_count);
-            // Reset accumulators for the next interval
-            m_lat_sum_us        = 0;
-            m_lat_count         = 0;
-            m_lat_min_us        = UINT64_MAX;
-            m_lat_max_us        = 0;
-            m_last_lat_print_us = now;
+        if (bbox_msg->capture_ts_us > now) {
+            // Source clock is ahead of render clock — uint64 subtraction would underflow.
+            // Emit a one-time warning so the operator knows NTP sync is required.
+            if (!m_clock_skew_warned) {
+                DS_WARN("[E2E latency] Source clock is ahead of render clock by ~%" PRIu64
+                        " ms — enable NTP/PTP sync for E2E measurement\n",
+                        (bbox_msg->capture_ts_us - now) / 1000ULL);
+                m_clock_skew_warned = true;
+            }
+        } else {
+            const uint64_t lat = now - bbox_msg->capture_ts_us;
+            // Guard against implausible values (clock step, unsynced clocks > 10 s, etc.)
+            if (lat < 10'000'000ULL) {
+                m_lat_sum_us += lat;
+                ++m_lat_count;
+                if (lat < m_lat_min_us) m_lat_min_us = lat;
+                if (lat > m_lat_max_us) m_lat_max_us = lat;
+            }
+            const uint32_t interval_s = m_cfg.debug.stats_interval_s;
+            if (interval_s > 0 && m_lat_count > 0 &&
+                now - m_last_lat_print_us >= static_cast<uint64_t>(interval_s) * 1'000'000ULL) {
+                DS_INFO("[E2E latency capture→display]  avg=%.1f ms  min=%.1f ms  max=%.1f ms"
+                        "  samples=%" PRIu64 "\n",
+                        m_lat_sum_us / 1000.0 / static_cast<double>(m_lat_count),
+                        m_lat_min_us / 1000.0,
+                        m_lat_max_us / 1000.0,
+                        m_lat_count);
+                // Reset accumulators for the next interval
+                m_lat_sum_us        = 0;
+                m_lat_count         = 0;
+                m_lat_min_us        = UINT64_MAX;
+                m_lat_max_us        = 0;
+                m_last_lat_print_us = now;
+            }
         }
     }
 
     // ---- SEI in-band E2E latency (capture_ts embedded in H.264 SEI → display) ----
-    // Independent of ZMQ: the timestamp travels inside the RTP stream itself,
-    // so this measurement works even without a shared clock or ZMQ connectivity.
+    // The timestamp travels inside the RTP stream itself (independent of ZMQ).
+    // Also requires CLOCK_REALTIME sync between source and render.
     if (frame && frame->sei_capture_ts_us != 0) {
         const uint64_t now = ds_realtime_us();
-        const uint64_t lat = now - frame->sei_capture_ts_us;
-        if (lat < 10'000'000ULL) {
-            m_sei_lat_sum_us += lat;
-            ++m_sei_lat_count;
-            if (lat < m_sei_lat_min_us) m_sei_lat_min_us = lat;
-            if (lat > m_sei_lat_max_us) m_sei_lat_max_us = lat;
-        }
-        const uint32_t interval_s = m_cfg.debug.stats_interval_s;
-        if (interval_s > 0 && m_sei_lat_count > 0 &&
-            now - m_sei_last_print_us >=
-                static_cast<uint64_t>(interval_s) * 1'000'000ULL) {
-            DS_INFO("[E2E-SEI capture→display]  avg=%.1f ms  min=%.1f ms"
-                    "  max=%.1f ms  samples=%" PRIu64 "\n",
-                    m_sei_lat_sum_us / 1000.0 /
-                        static_cast<double>(m_sei_lat_count),
-                    m_sei_lat_min_us / 1000.0,
-                    m_sei_lat_max_us / 1000.0,
-                    m_sei_lat_count);
-            m_sei_lat_sum_us    = 0;
-            m_sei_lat_count     = 0;
-            m_sei_lat_min_us    = UINT64_MAX;
-            m_sei_lat_max_us    = 0;
-            m_sei_last_print_us = now;
+        if (frame->sei_capture_ts_us > now) {
+            if (!m_sei_clock_skew_warned) {
+                DS_WARN("[E2E-SEI] Source clock is ahead of render clock by ~%" PRIu64
+                        " ms — enable NTP/PTP sync for E2E measurement\n",
+                        (frame->sei_capture_ts_us - now) / 1000ULL);
+                m_sei_clock_skew_warned = true;
+            }
+        } else {
+            const uint64_t lat = now - frame->sei_capture_ts_us;
+            if (lat < 10'000'000ULL) {
+                m_sei_lat_sum_us += lat;
+                ++m_sei_lat_count;
+                if (lat < m_sei_lat_min_us) m_sei_lat_min_us = lat;
+                if (lat > m_sei_lat_max_us) m_sei_lat_max_us = lat;
+            }
+            const uint32_t interval_s = m_cfg.debug.stats_interval_s;
+            if (interval_s > 0 && m_sei_lat_count > 0 &&
+                now - m_sei_last_print_us >=
+                    static_cast<uint64_t>(interval_s) * 1'000'000ULL) {
+                DS_INFO("[E2E-SEI capture→display]  avg=%.1f ms  min=%.1f ms"
+                        "  max=%.1f ms  samples=%" PRIu64 "\n",
+                        m_sei_lat_sum_us / 1000.0 /
+                            static_cast<double>(m_sei_lat_count),
+                        m_sei_lat_min_us / 1000.0,
+                        m_sei_lat_max_us / 1000.0,
+                        m_sei_lat_count);
+                m_sei_lat_sum_us    = 0;
+                m_sei_lat_count     = 0;
+                m_sei_lat_min_us    = UINT64_MAX;
+                m_sei_lat_max_us    = 0;
+                m_sei_last_print_us = now;
+            }
         }
     }
 

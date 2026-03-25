@@ -98,5 +98,9 @@ private:
     uint64_t m_sei_lat_max_us    = 0;
     uint64_t m_sei_last_print_us = 0;
 
+    // One-time clock-skew warnings (source clock ahead of render clock).
+    bool m_clock_skew_warned     = false;
+    bool m_sei_clock_skew_warned = false;
+
     const DsRenderConfig& m_cfg;
 };

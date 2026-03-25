@@ -59,6 +59,6 @@
 
     "debug": {
         "log_level":        2,
-        "stats_interval_s": 10
+        "stats_interval_s": 5
     }
 }

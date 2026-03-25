@@ -169,18 +169,36 @@ render: udpsrc port=5004 multicast-group=239.1.1.1
 
 ### Bounding-Box Path (ZMQ)
 
+The bind/connect roles **depend on transport mode** to ensure the side that knows
+the remote IP is the one that connects.
+
+**Multicast (default) — source binds, render connects:**
 ```
-source tracker thread    → zmq_send(DsMsgBbox, ZMQ_NOBLOCK)
-                              │  ZMQ PUSH, HWM=1, SNDTIMEO=0
-                              │  transport: TCP (default tcp://*:5560)
-                              ▼
-render ZMQ PULL thread   ← zmq_recv(DsMsgBbox)
-                              │  ZMQ PULL, HWM=1, RCVTIMEO=100ms
-                              ▼
-                          m_latest_bbox  (shared_ptr, mutex-guarded)
-                              ▼
-render main thread        DisplayOutput::present() → draw_bboxes()
+source: zmq_bind(tcp://*:5560)          ← always reachable on any interface
+           │  ZMQ PUSH, HWM=1, SNDTIMEO=0
+           ▼
+render: zmq_connect(tcp://<source-ip>:5560)
+           │  ZMQ PULL, HWM=1, RCVTIMEO=100ms
+           ▼
+        m_bbox_ring (ring buffer, mutex-guarded)
+           ▼
+render main thread: DisplayOutput::present() → draw_bboxes()
 ```
+
+**Unicast (--dest) — render binds, source connects:**
+```
+render: zmq_bind(tcp://*:5560)          ← source knows render IP from --dest
+           ▲  ZMQ PULL, HWM=1, RCVTIMEO=100ms
+           │
+source: zmq_connect(tcp://<render-ip>:5560)
+           │  ZMQ PUSH, HWM=1, SNDTIMEO=0
+           │  (render_endpoint host is set from --dest argument)
+```
+
+In both modes the PUSH/PULL roles are unchanged — only bind and connect are swapped.
+ZMQ `source_endpoint` (`tcp://*:5560`) is always the bind address; `render_endpoint`
+(`tcp://<host>:5560`) is always the connect address. `--dest` automatically rewrites
+`render_endpoint` to point at the render machine's IP.
 
 ---
 
@@ -251,7 +269,7 @@ visionbridge/
 sudo apt install \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libgstreamer-plugins-bad1.0-dev \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
   gstreamer1.0-libav gstreamer1.0-vaapi \
   libsdl2-dev libzmq3-dev libopencv-dev nlohmann-json3-dev
 ```
@@ -260,9 +278,9 @@ sudo apt install \
 
 ## Building
 
-Both build systems produce two executables: `visionbridge_source` and `visionbridge_render`.
+Visionbridge supports two build methods (CMake & Meson) and both produce two executables: `visionbridge_source` and `visionbridge_render`.
 
-### CMake (recommended for standalone development)
+### CMake
 
 ```bash
 # From visionbridge/ directory:
@@ -276,7 +294,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-### Meson (recommended for integration with the vsync project)
+### Meson
 
 ```bash
 # From visionbridge/ directory:
@@ -284,18 +302,6 @@ make -j$(nproc)
 ./build_meson.sh debug                  # debug build
 ./build_meson.sh debugoptimized clean   # clean + rebuild
 
-# Or from the repo root:
-meson setup build -Dbuild_visionbridge=true --buildtype=release
-ninja -C build visionbridge/visionbridge_source visionbridge/visionbridge_render
-```
-
-### Building as part of the vsync project (CMake)
-
-```bash
-# From the repo root:
-cmake .. -DBUILD_VISIONBRIDGE=ON -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-```
 
 ### YOLO build flag
 
@@ -356,7 +362,9 @@ you only need to override what differs from the defaults.
         "hw_decode":    false           // unused on source side
     },
     "zmq": {
-        "source_endpoint": "tcp://*:5560"
+        "source_endpoint": "tcp://*:5560",        // bind address for multicast mode (PUSH binds)
+        "render_endpoint": "tcp://127.0.0.1:5560" // connect address for unicast mode (PUSH connects)
+                                                   // --dest overwrites the host part automatically
     },
     "debug": {
         "log_level":        2,          // 0=ERR 1=WARN 2=INFO 3=DBG 4=TRACE
@@ -552,9 +560,17 @@ right after `SDL_RenderPresent()` and the delta is accumulated into a running av
 | Same machine | Exact — shared `CLOCK_REALTIME` |
 | Two machines, NTP/chrony synced | ±1–5 ms typical |
 | Two machines, PTP/ptp4l synced (recommended) | ±0.1–0.5 ms |
-| No sync | Latency values reflect clock offset — relative changes still meaningful |
+| No sync | **E2E stat suppressed** — a one-time `[WARN]` is printed instead |
 
-Samples where `latency > 10 s` are discarded as clock-skew protection.
+When the source clock is *ahead* of the render clock, the `uint64_t` subtraction
+would silently underflow to a huge value. Instead, the code detects `capture_ts_us > now`,
+logs a one-time warning with the measured skew, and skips the sample:
+```
+[WARN] [E2E latency] Source clock is ahead of render clock by ~847 ms — enable NTP/PTP sync for E2E measurement
+```
+The same guard applies to the SEI in-band path (`[E2E-SEI]`).
+
+Samples where `latency > 10 s` (post-guard) are discarded as clock-step protection.
 The accumulator resets every `stats_interval_s` seconds.
 
 > **Note:** YOLO inference on CPU typically takes 25–50 ms per frame at 416×416 on modern
@@ -708,18 +724,38 @@ the hardware is unavailable it falls back to software (`avdec_h264`) automatical
 
 From the CLI (no config file edits needed):
 ```bash
-./build/visionbridge_source --dest 192.168.1.20        # unicast to render machine
-./build/visionbridge_render --unicast 192.168.1.10     # receive from source machine
+./build/visionbridge_source --dest 192.168.1.20        # unicast RTP + ZMQ connect to render
+./build/visionbridge_render --unicast 192.168.1.10     # unicast RTP + ZMQ bind
 ```
+
+`--dest` does two things: it sets the RTP `udpsink` destination **and** rewrites
+`zmq.render_endpoint` to `tcp://192.168.1.20:5560` so the ZMQ PUSH socket connects
+to the render machine instead of binding. The render side (`--unicast`) correspondingly
+binds its ZMQ PULL socket on `tcp://*:5560` so the source can reach it.
+
+The ZMQ topology in unicast is therefore the **reverse** of multicast:
+
+| Mode | Source ZMQ | Render ZMQ |
+|---|---|---|
+| Multicast (default) | PUSH `bind(tcp://*:5560)` | PULL `connect(tcp://source:5560)` |
+| Unicast (`--dest`) | PUSH `connect(tcp://render:5560)` | PULL `bind(tcp://*:5560)` |
 
 Or via `configs/source.json` and `configs/render.json`:
 ```json
 // source.json
-"transport": { "host": "192.168.1.20", "rtp_port": 5004, "multicast": false }
+"transport": { "host": "192.168.1.20", "rtp_port": 5004, "multicast": false },
+"zmq":       { "source_endpoint": "tcp://*:5560",
+               "render_endpoint": "tcp://192.168.1.20:5560" }
 
 // render.json
-"transport": { "host": "192.168.1.10", "rtp_port": 5004, "multicast": false }
+"transport": { "host": "0.0.0.0", "rtp_port": 5004, "multicast": false },
+"zmq":       { "source_endpoint": "tcp://*:5560",
+               "render_endpoint": "tcp://127.0.0.1:5560" }
 ```
+
+> **Note:** When editing config files directly for unicast, `render_endpoint` in
+> `source.json` must point at the render machine's IP. The render node's ZMQ
+> socket always binds to `source_endpoint` (`tcp://*:5560`) in unicast mode.
 
 ### Disabling individual detectors
 

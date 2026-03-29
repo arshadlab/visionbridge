@@ -45,6 +45,8 @@
         "multicast_ttl": 4
     },
 
+    "appsink_sync": true,
+
     "codec": {
         "bitrate_kbps": 9000,
         "keyint":       1,

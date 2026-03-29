@@ -140,10 +140,10 @@ std::string StreamDecoder::build_pipeline_str() const {
 
     ss << " ! videoconvert"
        << " ! video/x-raw,format=RGBA"
-       // decoder_sync=false: deliver frames as fast as decoded so bbox ZMQ and video stay
-       // in sync. Frame rate is capped in the render loop by display_fps config.
-       // decoder_sync=true: pace to GStreamer clock (accurate timing, may misalign bboxes).
-       << " ! appsink name=vsink sync=" << (m_cfg.decoder_sync ? "true" : "false")
+       // sync=false: deliver frames free-run as fast as decoded; frame rate is capped
+       // in the render loop by display_fps.  sync=true would pace to the GStreamer clock
+       // and risk misaligning decoded frames with ZMQ bbox messages.
+       << " ! appsink name=vsink sync=false"
        << " max-buffers=1 drop=true emit-signals=true";
 
     return ss.str();

@@ -218,6 +218,23 @@ bool DisplayOutput::present() {
             bbox_msg = latest_msg; // SEI absent or no exact match: use newest
     }
 
+    // Check whether the selected bbox is for exactly this video frame.
+    // Only meaningful when SEI is present (sei_frame_seq != 0).
+    if (frame && frame->sei_frame_seq != 0 && bbox_msg) {
+        if (bbox_msg->frame_seq == frame->sei_frame_seq) {
+            ++m_bbox_exact_count;
+        } else {
+            ++m_bbox_fallback_count;
+            const uint64_t skew = (bbox_msg->frame_seq > frame->sei_frame_seq)
+                                  ? bbox_msg->frame_seq - frame->sei_frame_seq
+                                  : frame->sei_frame_seq - bbox_msg->frame_seq;
+            m_bbox_seq_skew_sum += skew;
+            DS_WARN("[SYNC] fallback draw: video_seq=%" PRIu64 " bbox_seq=%" PRIu64
+                    " delta=%" PRIu64 " frames\n",
+                    frame->sei_frame_seq, bbox_msg->frame_seq, skew);
+        }
+    }
+
     if (frame) {
         // On first frame when display size was 0: resize window to native frame dimensions
         if (!m_window_sized) {
@@ -349,6 +366,33 @@ bool DisplayOutput::present() {
                 m_sei_lat_max_us    = 0;
                 m_sei_last_print_us = now;
             }
+        }
+    }
+
+    // ---- Bbox-frame sync quality stats (printed at same interval as E2E latency) ----
+    if (m_cfg.debug.stats_interval_s > 0) {
+        const uint64_t now_mono = ds_mono_us();
+        const uint64_t interval_us =
+            static_cast<uint64_t>(m_cfg.debug.stats_interval_s) * 1'000'000ULL;
+        if (now_mono - m_sync_last_print_us >= interval_us) {
+            const uint64_t total = m_bbox_exact_count + m_bbox_fallback_count;
+            if (total > 0) {
+                DS_INFO("[SYNC] bbox-frame alignment:"
+                        " exact=%" PRIu64 " (%.1f%%)"
+                        "  fallback=%" PRIu64
+                        "  avg_skew=%.2f frames\n",
+                        m_bbox_exact_count,
+                        100.0 * m_bbox_exact_count / static_cast<double>(total),
+                        m_bbox_fallback_count,
+                        m_bbox_fallback_count > 0
+                            ? static_cast<double>(m_bbox_seq_skew_sum) /
+                              static_cast<double>(m_bbox_fallback_count)
+                            : 0.0);
+                m_bbox_exact_count    = 0;
+                m_bbox_fallback_count = 0;
+                m_bbox_seq_skew_sum   = 0;
+            }
+            m_sync_last_print_us = now_mono;
         }
     }
 

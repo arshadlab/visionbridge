@@ -89,7 +89,11 @@ public:
     /// Stop and tear down the pipeline.
     void stop();
 
+    /// Toggle between PAUSED and PLAYING states.  Safe to call from any thread.
+    void toggle_pause();
+
     bool is_running() const { return m_running.load(); }
+    bool is_paused()  const { return m_paused.load(); }
 
 private:
     // ---- Pipeline construction ----
@@ -132,6 +136,7 @@ private:
     guint  m_timing_timer_id     = 0;
 
     std::atomic<bool>    m_running{false};
+    std::atomic<bool>    m_paused{false};
     std::atomic<uint64_t> m_frame_seq{0};
 
     // ---- Timing state (protected by m_timing_mtx) ----

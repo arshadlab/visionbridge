@@ -115,7 +115,8 @@ std::string CapturePipeline::build_pipeline_str() const {
     ss << "  t. ! queue leaky=downstream max-size-buffers=1"
           "         max-size-bytes=0 max-size-time=0"
        << " ! appsink name=vsink"
-          "   sync=false emit-signals=true"
+       << "   sync=" << (m_cfg.appsink_sync ? "true" : "false")
+       << "   emit-signals=true"
           "   max-buffers=1 drop=true";
 
     // ----- Encode branch -----
@@ -150,16 +151,17 @@ std::string CapturePipeline::build_pipeline_str() const {
           " ssrc=987654321 pt=96 mtu=1400";
 
     // ----- Transport sink -----
+    const char* udp_sync = m_cfg.appsink_sync ? "true" : "false";
     if (tr.multicast) {
         ss << " ! udpsink host=\"" << tr.host << "\""
            << " port=" << tr.rtp_port
-           << " auto-multicast=true sync=false";
+           << " auto-multicast=true sync=" << udp_sync;
         if (!tr.iface.empty())
             ss << " multicast-iface=\"" << tr.iface << "\"";
     } else {
         ss << " ! udpsink host=\"" << tr.host << "\""
            << " port=" << tr.rtp_port
-           << " sync=false";
+           << " sync=" << udp_sync;
     }
 
     return ss.str();
@@ -476,6 +478,22 @@ void CapturePipeline::gst_thread_func() {
             }, this);
     }
     g_main_loop_run(m_loop);
+}
+
+// ---------------------------------------------------------------------------
+// toggle_pause
+// ---------------------------------------------------------------------------
+void CapturePipeline::toggle_pause() {
+    if (!m_pipeline || !m_running.load()) return;
+    if (m_paused.load()) {
+        m_paused.store(false);
+        gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
+        DS_INFO("CapturePipeline: resumed\n");
+    } else {
+        m_paused.store(true);
+        gst_element_set_state(m_pipeline, GST_STATE_PAUSED);
+        DS_INFO("CapturePipeline: paused\n");
+    }
 }
 
 // ---------------------------------------------------------------------------

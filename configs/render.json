@@ -22,7 +22,6 @@
     },
 
     "jitter_buffer_ms": 20,
-    "decoder_sync":     false,
 
     "display": {
         "width":             1280,

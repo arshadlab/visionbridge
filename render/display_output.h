@@ -102,5 +102,13 @@ private:
     bool m_clock_skew_warned     = false;
     bool m_sei_clock_skew_warned = false;
 
+    // Bbox-frame synchronisation quality — main thread only, no mutex needed.
+    // Counts how often an exact SEI frame_seq match was found vs a fallback to
+    // the most-recently-received bbox was used instead.
+    uint64_t m_bbox_exact_count    = 0; ///< video seq matched bbox seq exactly
+    uint64_t m_bbox_fallback_count = 0; ///< no exact match; latest bbox used
+    uint64_t m_bbox_seq_skew_sum   = 0; ///< sum of |video_seq - bbox_seq| for fallbacks
+    uint64_t m_sync_last_print_us  = 0;
+
     const DsRenderConfig& m_cfg;
 };

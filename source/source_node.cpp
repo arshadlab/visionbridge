@@ -13,6 +13,8 @@
 #include <zmq.h>
 #include <cinttypes>
 #include <cstring>
+#include <termios.h>
+#include <unistd.h>
 
 // ---------------------------------------------------------------------------
 SourceNode::SourceNode(const DsSourceConfig& cfg) : m_cfg(cfg) {}
@@ -120,11 +122,36 @@ int SourceNode::run() {
         return 1;
     }
 
-    DS_INFO("SourceNode: running. Press Ctrl+C to stop.\n");
+    // Put stdin into raw non-blocking mode so spacebar can be read without Enter.
+    // Only active when stdin is a real terminal (skipped when piped/scripted).
+    struct termios orig_termios{};
+    const bool tty = isatty(STDIN_FILENO);
+    if (tty) {
+        tcgetattr(STDIN_FILENO, &orig_termios);
+        struct termios raw = orig_termios;
+        raw.c_lflag &= ~static_cast<unsigned>(ICANON | ECHO);
+        raw.c_cc[VMIN]  = 0; // non-blocking: return immediately if no char available
+        raw.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+        DS_INFO("SourceNode: running. Press SPACE to pause/resume, Ctrl+C to stop.\n");
+    } else {
+        DS_INFO("SourceNode: running. Press Ctrl+C to stop.\n");
+    }
 
     while (!m_stop_requested.load() && m_pipeline->is_running()) {
+        if (tty) {
+            char ch = 0;
+            if (read(STDIN_FILENO, &ch, 1) == 1 && ch == ' ') {
+                m_pipeline->toggle_pause();
+                DS_INFO("SourceNode: pipeline %s\n",
+                        m_pipeline->is_paused() ? "PAUSED" : "RESUMED");
+            }
+        }
         ds_sleep_ms(100);
     }
+
+    if (tty)
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 
     m_pipeline->stop();
     DS_INFO("SourceNode: stopped\n");

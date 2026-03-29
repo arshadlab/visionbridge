@@ -105,7 +105,10 @@ struct DsSourceConfig {
     DsZmqConfig     zmq;
     DsDebugConfig   debug;
 
-    uint32_t jitter_buffer_ms = 0; ///< unused on source, kept for completeness
+    uint32_t jitter_buffer_ms = 0;   ///< unused on source, kept for completeness
+    /// appsink sync: false=free-run (lowest latency, may drop frames under load)
+    ///               true=clock-paced (natural playback rate, e.g. for file input)
+    bool     appsink_sync     = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -118,7 +121,6 @@ struct DsRenderConfig {
     DsDebugConfig     debug;
 
     uint32_t jitter_buffer_ms = 20;  ///< RTP jitter buffer (ms) — low for live
-    bool     decoder_sync     = false; ///< appsink sync: false=free-run (bbox aligned), true=clock-paced
 
     // Display
     uint32_t    display_width  = 0;   ///< 0 = match decoded frame width

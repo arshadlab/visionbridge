@@ -116,6 +116,8 @@ bool ConfigLoader::load_source(const std::string& path, DsSourceConfig& out) {
         if (j.contains("zmq"))       out.zmq       = parse_zmq      (j.at("zmq"));
         if (j.contains("debug"))     out.debug     = parse_debug    (j.at("debug"));
 
+        out.appsink_sync = jget<bool>(j, "appsink_sync", false);
+
     } catch (const std::exception& e) {
         DS_ERR("Source config parse error: %s\n", e.what());
         return false;
@@ -147,7 +149,7 @@ bool ConfigLoader::load_render(const std::string& path, DsRenderConfig& out) {
         if (j.contains("zmq"))       out.zmq       = parse_zmq      (j.at("zmq"));
         if (j.contains("debug"))     out.debug     = parse_debug    (j.at("debug"));
 
-        out.jitter_buffer_ms = jget<uint32_t>(j, "jitter_buffer_ms", 20);        out.decoder_sync        = jget<bool>    (j, "decoder_sync",     false);
+        out.jitter_buffer_ms = jget<uint32_t>(j, "jitter_buffer_ms", 20);
         if (j.contains("display")) {
             const auto& d = j.at("display");
             out.display_width      = jget<uint32_t>   (d, "width",             0);

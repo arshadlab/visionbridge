@@ -45,10 +45,13 @@ static void print_usage(const char* prog) {
         "Usage: %s [OPTIONS]\n\n"
         "  --config <path>       Path to render JSON config [default: configs/render.json]\n"
         "  --source <host>       Override source host; auto-detects multicast vs unicast\n"
-        "                        from IP range (224.x.x.x-239.x.x.x → multicast)\n"
+        "                        from IP range (224.x.x.x-239.x.x.x -> multicast)\n"
         "  --unicast <host>      Set unicast source IP and disable multicast\n"
         "  --multicast <group>   Set multicast group and enable multicast\n"
-        "  --log-level <0-4>     0=OFF 1=ERR 2=INFO 3=DBG 4=TRACE [default: 2]\n"
+        "  --backend <name>      Display backend: sdl | egl | wayland [default: sdl]\n"
+        "  --drm-device <path>   DRM device for egl backend, e.g. /dev/dri/card1 [default: auto]\n"
+        "  --drm-output <N>      DRM output index for egl backend [default: 0]\n"
+        "  --log-level, -l <level>  Log level: error | warn | info | debug | trace [default: info]\n"
         "  --help                Print this message\n"
         "\n"
         "Transport mode (default: multicast 239.1.1.1:5004 per render.json):\n"
@@ -58,9 +61,15 @@ static void print_usage(const char* prog) {
         "  Auto-detect:    %s --source 192.168.1.10         # unicast (non-multicast IP)\n"
         "  Auto-detect:    %s --source 239.1.1.1            # multicast\n"
         "\n"
+        "Display backend examples:\n"
+        "  %s --backend sdl                                  # SDL2 window (default)\n"
+        "  %s --backend wayland                              # Wayland EGL fullscreen\n"
+        "  %s --backend egl                                  # EGL/KMS bare-metal TTY\n"
+        "  %s --backend egl --drm-device /dev/dri/card1 --drm-output 1\n"
+        "\n"
         "Detector bbox overlay colours:\n"
-        "  Stub → gray   MOG2 → green   YOLO → red\n",
-        prog, prog, prog, prog, prog, prog);
+        "  Stub -> gray   MOG2 -> green   YOLO -> red\n",
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 // Returns true if 'host' is an IPv4 multicast address (224.0.0.0/4).
@@ -92,15 +101,29 @@ int main(int argc, char* argv[]) {
     std::string source_host;          // --source  (auto-detect mode)
     std::string unicast_host;         // --unicast (explicit unicast)
     std::string multicast_group;      // --multicast (explicit multicast)
+    std::string cli_backend;          // --backend
+    std::string cli_drm_device;       // --drm-device
+    int cli_drm_output = -1;          // --drm-output
     int log_level = -1;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--help"))      { print_usage(argv[0]); return 0; }
-        else if (!strcmp(argv[i], "--config")    && i+1 < argc) config_path     = argv[++i];
-        else if (!strcmp(argv[i], "--source")    && i+1 < argc) source_host     = argv[++i];
-        else if (!strcmp(argv[i], "--unicast")   && i+1 < argc) unicast_host    = argv[++i];
-        else if (!strcmp(argv[i], "--multicast") && i+1 < argc) multicast_group = argv[++i];
-        else if (!strcmp(argv[i], "--log-level") && i+1 < argc) log_level       = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--config")      && i+1 < argc) config_path     = argv[++i];
+        else if (!strcmp(argv[i], "--source")      && i+1 < argc) source_host     = argv[++i];
+        else if (!strcmp(argv[i], "--unicast")     && i+1 < argc) unicast_host    = argv[++i];
+        else if (!strcmp(argv[i], "--multicast")   && i+1 < argc) multicast_group = argv[++i];
+        else if (!strcmp(argv[i], "--backend")     && i+1 < argc) cli_backend     = argv[++i];
+        else if (!strcmp(argv[i], "--drm-device")  && i+1 < argc) cli_drm_device  = argv[++i];
+        else if (!strcmp(argv[i], "--drm-output")  && i+1 < argc) cli_drm_output  = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "--log-level") || !strcmp(argv[i], "-l")) && i+1 < argc) {
+            const char* lvl = argv[++i];
+            if      (!strcmp(lvl, "error")) log_level = 0;
+            else if (!strcmp(lvl, "warn"))  log_level = 1;
+            else if (!strcmp(lvl, "info"))  log_level = 2;
+            else if (!strcmp(lvl, "debug")) log_level = 3;
+            else if (!strcmp(lvl, "trace")) log_level = 4;
+            else { fprintf(stderr, "Unknown log level: %s\n", lvl); print_usage(argv[0]); return 1; }
+        }
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
     }
 
@@ -141,6 +164,11 @@ int main(int argc, char* argv[]) {
     // Override log level from config if CLI didn't set it
     if (log_level < 0) g_ds_log_level.store(cfg.debug.log_level);
 
+    // Apply display backend overrides (CLI takes priority over config)
+    if (!cli_backend.empty())    cfg.backend          = cli_backend;
+    if (!cli_drm_device.empty()) cfg.drm_device       = cli_drm_device;
+    if (cli_drm_output >= 0)     cfg.drm_output_index = cli_drm_output;
+
     DS_INFO("visionbridge-render starting\n");
     DS_INFO("  transport: %s %s:%u\n",
             cfg.transport.multicast ? "[MULTICAST]" : "[UNICAST]",
@@ -150,6 +178,7 @@ int main(int argc, char* argv[]) {
             cfg.transport.multicast ? "connect" : "bind");
     DS_INFO("  jitter:    %u ms\n", cfg.jitter_buffer_ms);
     DS_INFO("  hw_decode: %s\n", cfg.codec.hw_decode ? "yes" : "no");
+    DS_INFO("  backend:   %s\n", cfg.backend.c_str());
 
     // Initialize GStreamer
     gst_init(nullptr, nullptr);

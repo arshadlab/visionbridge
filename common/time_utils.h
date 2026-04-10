@@ -48,4 +48,10 @@ inline void ds_sleep_ms(uint32_t ms) {
     nanosleep(&ts, nullptr);
 }
 
+/// Sleep for the given number of microseconds.
+inline void ds_usleep(uint32_t us) {
+    struct timespec ts{ 0, static_cast<long>(us) * 1000L };
+    nanosleep(&ts, nullptr);
+}
+
 #endif // VISIONBRIDGE_TIME_UTILS_H

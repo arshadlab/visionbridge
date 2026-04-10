@@ -11,7 +11,7 @@
 // ---------------------------------------------------------------------------
 // Wire protocol version — bump when message layout changes.
 // ---------------------------------------------------------------------------
-#define DS_PROTOCOL_VERSION 2U
+#define DS_PROTOCOL_VERSION 3U
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -64,6 +64,8 @@ struct DsMsgBbox {
     uint64_t frame_seq;         ///< Monotonically increasing frame counter
     uint64_t capture_ts_us;     ///< CLOCK_REALTIME when frame entered appsink (µs)
     uint64_t send_ts_us;        ///< CLOCK_REALTIME just before ZMQ send (µs)
+    uint32_t src_width;         ///< Source appsink frame width (bbox coordinate space)
+    uint32_t src_height;        ///< Source appsink frame height (bbox coordinate space)
     uint32_t bbox_count;        ///< Number of valid entries in bboxes[]
     DsBbox   bboxes[DS_MAX_BBOXES];
 } __attribute__((packed));

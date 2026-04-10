@@ -7,9 +7,9 @@
 #   meson setup builddir
 #   ninja -C builddir
 
-project('visionbridge', 'cpp',
+project('visionbridge', ['cpp', 'c'],
   version         : '1.0.0',
-  default_options : ['cpp_std=c++17', 'warning_level=2'],
+  default_options : ['cpp_std=c++17', 'c_std=c11', 'warning_level=2'],
 )
 
 cpp_compiler = meson.get_compiler('cpp')
@@ -24,6 +24,53 @@ gst_rtp_dep   = dependency('gstreamer-rtp-1.0',   required: true)
 
 zmq_dep  = dependency('libzmq', required: true)
 sdl2_dep = dependency('sdl2',   required: true)
+
+# EGL / GBM / DRM (for --backend egl)
+egl_dep     = dependency('egl',       required: false)
+glesv2_dep  = dependency('glesv2',    required: false)
+gbm_dep     = dependency('gbm',       required: false)
+libdrm_dep  = dependency('libdrm',    required: false)
+have_egl = egl_dep.found() and glesv2_dep.found() and gbm_dep.found() and libdrm_dep.found()
+
+# Wayland EGL (for --backend wayland)
+wayland_client_dep = dependency('wayland-client',   required: false)
+wayland_egl_dep    = dependency('wayland-egl',      required: false)
+wayland_protos_dep = dependency('wayland-protocols', required: false)
+have_wayland = have_egl and wayland_client_dep.found() and wayland_egl_dep.found() and wayland_protos_dep.found()
+
+# xdg-shell protocol generated C sources (needed only for Wayland EGL)
+xdg_shell_src = []
+xdg_shell_args = []
+if have_wayland
+  wayland_scanner = find_program('wayland-scanner', required: false)
+  if wayland_scanner.found()
+    wp_stable = wayland_protos_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/xdg-shell/xdg-shell.xml'
+    xdg_shell_hdr = custom_target('xdg-shell-client-protocol.h',
+      output  : 'xdg-shell-client-protocol.h',
+      input   : wp_stable,
+      command : [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+      install : false,
+    )
+    xdg_shell_c = custom_target('xdg-shell-protocol.c',
+      output  : 'xdg-shell-protocol.c',
+      input   : wp_stable,
+      command : [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+      install : false,
+    )
+    xdg_shell_src = [xdg_shell_hdr, xdg_shell_c]
+    xdg_shell_args = ['-DHAVE_WAYLAND_EGL=1']
+    message('visionbridge: Wayland EGL backend enabled')
+  else
+    have_wayland = false
+    message('visionbridge: wayland-scanner not found — Wayland EGL backend disabled')
+  endif
+endif
+
+if have_egl
+  message('visionbridge: EGL/KMS backend enabled')
+else
+  message('visionbridge: EGL/KMS backend disabled (missing egl/glesv2/gbm/libdrm)')
+endif
 
 # nlohmann/json — header-only
 nlohmann_dep = dependency('nlohmann_json', required: false)
@@ -110,25 +157,47 @@ ds_source_exe = executable('visionbridge_source',
 # ---------------------------------------------------------------------------
 # visionbridge_render
 # ---------------------------------------------------------------------------
+render_sources = files(
+  'render/main.cpp',
+  'render/render_node.cpp',
+  'render/stream_decoder.cpp',
+  'render/display_output_base.cpp',
+  'render/display_output_sdl.cpp',
+)
+render_deps = [
+  ds_common_dep,
+  gst_dep, gst_app_dep, gst_video_dep, gst_rtp_dep,
+  zmq_dep,
+  sdl2_dep,
+  threads_dep,
+  rt_dep,
+]
+render_args = ['-Wall', '-Wextra']
+
+if have_egl
+  render_sources += files(
+    'render/display_output_egl.cpp',
+  )
+  render_deps += [egl_dep, glesv2_dep, gbm_dep, libdrm_dep]
+  render_args += ['-DHAVE_EGL=1']
+endif
+
+if have_wayland
+  render_sources += files(
+    'render/display_output_wl_egl.cpp',
+  )
+  render_sources += xdg_shell_src
+  render_deps += [wayland_client_dep, wayland_egl_dep]
+  render_args += xdg_shell_args
+endif
+
 ds_render_exe = executable('visionbridge_render',
-  files(
-    'render/main.cpp',
-    'render/render_node.cpp',
-    'render/stream_decoder.cpp',
-    'render/display_output.cpp',
-  ),
+  render_sources,
   include_directories : [ds_common_inc, ds_render_inc],
-  dependencies        : [
-    ds_common_dep,
-    gst_dep, gst_app_dep, gst_video_dep, gst_rtp_dep,
-    zmq_dep,
-    sdl2_dep,
-    threads_dep,
-    rt_dep,
-  ],
-  cpp_args         : ['-Wall', '-Wextra'],
-  override_options : ['cpp_std=c++17'],
-  install          : true,
+  dependencies        : render_deps,
+  cpp_args            : render_args,
+  override_options    : ['cpp_std=c++17'],
+  install             : true,
 )
 
 # ---------------------------------------------------------------------------

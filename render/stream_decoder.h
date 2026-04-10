@@ -96,7 +96,7 @@ private:
     static GstPadProbeReturn sei_extract_probe_cb(GstPad*, GstPadProbeInfo*, gpointer);
 
     void gst_thread_func();
-    void print_timing_stats();
+    void emit_periodic_stats();
 
     DsRenderConfig m_cfg;
     bool m_hw_decode = false; ///< resolved at start() — may differ from cfg if VAAPI absent
@@ -131,11 +131,19 @@ private:
 
     std::atomic<bool>     m_running{false};
     std::atomic<uint64_t> m_frames_decoded{0};
+    std::atomic<uint64_t> m_frames_dropped{0}; ///< SEI seq-gap drops detected in on_new_sample
+    uint64_t              m_last_sei_seq = 0;   ///< last sei_frame_seq seen (main thread)
 
     // Timing state (protected by m_timing_mtx)
     mutable std::mutex m_timing_mtx;
-    uint64_t    m_pre_dec_ts   = 0; ///< h264parse src pad timestamp
-    uint64_t    m_vdec_sink_ts = 0; ///< vdec sink pad timestamp
+    // FIFO entry timestamps (push at entry probe, pop at exit probe).
+    // Using a small ring large enough to cover max decoder in-flight depth.
+    static constexpr int kProbeFifoSize = 16;
+    struct ProbeEntry { uint64_t ts = 0; bool used = false; };
+    ProbeEntry m_pre_dec_fifo [kProbeFifoSize]{}; ///< h264parse src entry timestamps
+    ProbeEntry m_vdec_sink_fifo[kProbeFifoSize]{}; ///< vdec sink entry timestamps
+    size_t     m_pre_dec_head  = 0;
+    size_t     m_vdec_head     = 0;
     LatencyStats m_pure_dec_stats;  ///< vdec sink→src (pure HW/SW decode)
     LatencyStats m_total_dec_stats; ///< h264parse src→appsink sink
 };

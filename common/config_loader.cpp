@@ -159,6 +159,9 @@ bool ConfigLoader::load_render(const std::string& path, DsRenderConfig& out) {
                                                        "VisionBridge");
             out.fullscreen         = jget<bool>       (d, "fullscreen",        false);
             out.sdl_display_index  = jget<int>        (d, "sdl_display_index", -1);
+            out.backend            = jget<std::string>(d, "backend",           "sdl");
+            out.drm_device         = jget<std::string>(d, "drm_device",        "");
+            out.drm_output_index   = jget<int>        (d, "drm_output_index",  0);
         }
 
     } catch (const std::exception& e) {

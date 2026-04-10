@@ -207,6 +207,24 @@ GstFlowReturn StreamDecoder::on_new_sample(GstAppSink* sink, gpointer data) {
 
     ++self->m_frames_decoded;
 
+    // Per-frame TRACE and drop detection via SEI sequence number
+    if (frame->sei_frame_seq != 0) {
+        const uint64_t seq = frame->sei_frame_seq;
+        DS_TRACE("StreamDecoder: decoded seq=%" PRIu64 " %ux%u\n",
+                 seq, frame->width, frame->height);
+        const uint64_t last = self->m_last_sei_seq;
+        if (last != 0 && seq > last + 1) {
+            const uint64_t dropped = seq - last - 1;
+            self->m_frames_dropped.fetch_add(dropped, std::memory_order_relaxed);
+            DS_WARN("StreamDecoder: seq gap %" PRIu64 "→%" PRIu64
+                    " — %" PRIu64 " frame(s) dropped\n", last, seq, dropped);
+        }
+        self->m_last_sei_seq = seq;
+    } else {
+        DS_TRACE("StreamDecoder: decoded (no SEI) %ux%u\n",
+                 frame->width, frame->height);
+    }
+
     if (self->m_frame_cb)
         self->m_frame_cb(frame);
 
@@ -247,50 +265,63 @@ gboolean StreamDecoder::bus_callback(GstBus* /*bus*/, GstMessage* msg, gpointer 
 // Timing probes
 // ---------------------------------------------------------------------------
 
-// h264parse src pad — record pre-decode entry time (overwrite scalar)
+// h264parse src pad — push entry timestamp into FIFO
 GstPadProbeReturn StreamDecoder::pre_dec_probe_cb(GstPad*, GstPadProbeInfo*,
                                                   gpointer udata) {
     auto* self = static_cast<StreamDecoder*>(udata);
     const uint64_t ts = ds_mono_us();
     std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    self->m_pre_dec_ts = ts;
+    auto& slot = self->m_pre_dec_fifo[self->m_pre_dec_head % kProbeFifoSize];
+    slot.ts   = ts;
+    slot.used = true;
+    ++self->m_pre_dec_head;
     return GST_PAD_PROBE_OK;
 }
 
-// vdec sink pad — record decoder entry time
+// vdec sink pad — push decoder entry timestamp into FIFO
 GstPadProbeReturn StreamDecoder::vdec_sink_probe_cb(GstPad*, GstPadProbeInfo*,
                                                     gpointer udata) {
     auto* self = static_cast<StreamDecoder*>(udata);
     const uint64_t ts = ds_mono_us();
     std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    self->m_vdec_sink_ts = ts;
+    auto& slot = self->m_vdec_sink_fifo[self->m_vdec_head % kProbeFifoSize];
+    slot.ts   = ts;
+    slot.used = true;
+    ++self->m_vdec_head;
     return GST_PAD_PROBE_OK;
 }
 
-// vdec src pad — compute pure decode latency
+// vdec src pad — pop oldest vdec_sink entry and record pure decode latency
 GstPadProbeReturn StreamDecoder::vdec_src_probe_cb(GstPad*, GstPadProbeInfo*,
                                                    gpointer udata) {
     auto* self = static_cast<StreamDecoder*>(udata);
     const uint64_t now = ds_mono_us();
     std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    if (self->m_vdec_sink_ts != 0) {
-        const uint64_t lat = now - self->m_vdec_sink_ts;
-        if (lat < 2000000ULL) self->m_pure_dec_stats.record(lat);
-        self->m_vdec_sink_ts = 0;
+    // Find oldest unused entry in the FIFO ring
+    for (auto& e : self->m_vdec_sink_fifo) {
+        if (e.used) {
+            const uint64_t lat = now - e.ts;
+            if (lat < 2000000ULL) self->m_pure_dec_stats.record(lat);
+            e.used = false;
+            break;
+        }
     }
     return GST_PAD_PROBE_OK;
 }
 
-// appsink sink pad — compute total decode latency (pre_dec → appsink entry)
+// appsink sink pad — pop oldest pre_dec entry and record total decode latency
 GstPadProbeReturn StreamDecoder::appsink_probe_cb(GstPad*, GstPadProbeInfo*,
                                                   gpointer udata) {
     auto* self = static_cast<StreamDecoder*>(udata);
     const uint64_t now = ds_mono_us();
     std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    if (self->m_pre_dec_ts != 0) {
-        const uint64_t lat = now - self->m_pre_dec_ts;
-        if (lat < 2000000ULL) self->m_total_dec_stats.record(lat);
-        self->m_pre_dec_ts = 0;
+    for (auto& e : self->m_pre_dec_fifo) {
+        if (e.used) {
+            const uint64_t lat = now - e.ts;
+            if (lat < 2000000ULL) self->m_total_dec_stats.record(lat);
+            e.used = false;
+            break;
+        }
     }
     return GST_PAD_PROBE_OK;
 }
@@ -335,9 +366,9 @@ GstPadProbeReturn StreamDecoder::sei_extract_probe_cb(GstPad*, GstPadProbeInfo* 
 }
 
 // ---------------------------------------------------------------------------
-// print_timing_stats (called by GLib timer)
+// emit_periodic_stats (called by GLib timer)
 // ---------------------------------------------------------------------------
-void StreamDecoder::print_timing_stats() {
+void StreamDecoder::emit_periodic_stats() {
     LatencyStats pure_snap, total_snap;
     bool have_pure = false, have_total = false;
     {
@@ -345,16 +376,29 @@ void StreamDecoder::print_timing_stats() {
         if (!m_pure_dec_stats.empty())  { pure_snap  = m_pure_dec_stats.reset_and_return();  have_pure  = true; }
         if (!m_total_dec_stats.empty()) { total_snap = m_total_dec_stats.reset_and_return(); have_total = true; }
     }
-    if (have_pure)
-        DS_INFO("[TIMING-RECV] decode_pure:  cnt=%" PRIu64
-                " avg=%.0f min=%" PRIu64 " max=%" PRIu64 " us\n",
-                pure_snap.count, pure_snap.avg_us(),
-                pure_snap.min_us, pure_snap.max_us);
-    if (have_total)
-        DS_INFO("[TIMING-RECV] decode_total: cnt=%" PRIu64
-                " avg=%.0f min=%" PRIu64 " max=%" PRIu64 " us\n",
-                total_snap.count, total_snap.avg_us(),
-                total_snap.min_us, total_snap.max_us);
+
+    char line[256];
+    std::string msg = "[TIMING-RECV]\n";
+
+    auto append = [&](const char* tag, const LatencyStats& s) {
+        snprintf(line, sizeof(line),
+                 "  %-13s  avg=%6.0f  std=%5.0f  min=%6" PRIu64 "  max=%6" PRIu64
+                 "  us  (n=%" PRIu64 ")\n",
+                 tag, s.avg_us(), s.stddev_us(), s.min_us, s.max_us, s.count);
+        msg += line;
+    };
+    if (have_pure)  append("decode_pure",  pure_snap);
+    if (have_total) append("decode_total", total_snap);
+
+    // Always include frame counters so drops are visible even when timing is disabled
+    const uint64_t decoded = m_frames_decoded.load(std::memory_order_relaxed);
+    const uint64_t dropped = m_frames_dropped.load(std::memory_order_relaxed);
+    snprintf(line, sizeof(line),
+             "  frames decoded=%" PRIu64 "  dropped=%" PRIu64 "  last_seq=%" PRIu64 "\n",
+             decoded, dropped, m_last_sei_seq);
+    msg += line;
+
+    DS_INFO("%s", msg.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +408,7 @@ void StreamDecoder::gst_thread_func() {
     if (m_cfg.debug.stats_interval_s > 0) {
         m_timing_timer_id = g_timeout_add_seconds(m_cfg.debug.stats_interval_s,
             [](gpointer data) -> gboolean {
-                static_cast<StreamDecoder*>(data)->print_timing_stats();
+                static_cast<StreamDecoder*>(data)->emit_periodic_stats();
                 return G_SOURCE_CONTINUE;
             }, this);
     }

@@ -88,8 +88,17 @@ std::string CapturePipeline::build_pipeline_str() const {
 
     // ----- Input source -----
     if (in.type == "file" && !in.file.empty()) {
-        ss << "filesrc location=\"" << in.file << "\""
-           << " ! decodebin";
+        if (co.hw_decode) {
+            // Hardware-decoded path: qtdemux → h264parse → VA-API decoder.
+            // Avoids a full re-encode decode cycle through decodebin; faster and
+            // uses the GPU for decode, leaving CPU free for trackers.
+            ss << "filesrc location=\"" << in.file << "\""
+               << " ! qtdemux name=demux"
+               << "  demux.video_0 ! h264parse ! vah264dec";
+        } else {
+            ss << "filesrc location=\"" << in.file << "\""
+               << " ! decodebin";
+        }
     } else {
         // Live V4L2 webcam
         ss << "v4l2src device=\"" << in.device << "\"";
@@ -97,7 +106,7 @@ std::string CapturePipeline::build_pipeline_str() const {
 
     // ----- Common format conversion & scaling -----
     // Only insert videoscale/videorate when an override is actually requested.
-    ss << " ! videoconvert";
+    ss << " ! videoconvert name=vconv";
     if (in.width > 0 || in.height > 0)
         ss << " ! videoscale";
     if (in.fps_num > 0)
@@ -112,7 +121,7 @@ std::string CapturePipeline::build_pipeline_str() const {
     // ----- Tracker/appsink branch -----
     // leaky=downstream: if appsink is busy (tracker running), drop the incoming
     // frame rather than blocking the encode branch.
-    ss << "  t. ! queue leaky=downstream max-size-buffers=1"
+    ss << "  t. ! queue name=vtrack_q leaky=downstream max-size-buffers=1"
           "         max-size-bytes=0 max-size-time=0"
        << " ! appsink name=vsink"
        << "   sync=" << (m_cfg.appsink_sync ? "true" : "false")
@@ -120,34 +129,37 @@ std::string CapturePipeline::build_pipeline_str() const {
           "   max-buffers=1 drop=true";
 
     // ----- Encode branch -----
-    // videoconvert is required here: the tee delivers BGRx (needed by the
-    // appsink/OpenCV branch) but x264enc and vaapih264enc only accept YUV
-    // formats (I420, NV12, ...).  The conversion is fast (~1 ms) and is
-    // the only place we pay this cost.
-    ss << "  t. ! queue leaky=downstream max-size-buffers=2"
-          "         max-size-bytes=0 max-size-time=0"
-       << " ! videoconvert";
-
+    // hw path: leaky queue (vaapih264enc is fast; prefer drop over stall) with NV12
+    //          as the native VA-API input format.
+    // sw path: non-leaky queue with 10-buffer headroom for smoother pacing under
+    //          transient x264enc stalls, with explicit I420 cap.
     if (co.hw_encode) {
-        ss << " ! vaapih264enc name=venc rate-control=cbr"
-           << " bitrate="          << co.bitrate_kbps
-           << " keyframe-period="  << co.keyint
+        ss << "  t. ! queue name=venc_q leaky=downstream max-size-buffers=1"
+              "         max-size-bytes=0 max-size-time=0"
+           << " ! videoconvert"
+           << " ! video/x-raw,format=NV12"
+           << " ! vaapih264enc name=venc rate-control=cbr"
+           << " bitrate="         << co.bitrate_kbps
+           << " keyframe-period=" << co.keyint
            << " max-bframes=0 tune=low-power"
            << " ! video/x-h264,stream-format=byte-stream";
     } else {
-        // tune=zerolatency: disables lookahead and B-frames; combined with
-        // key-int-max=1 (all-intra) this gives the absolute minimum encode latency.
-        ss << " ! x264enc name=venc tune=zerolatency"
+        ss << "  t. ! queue name=venc_q max-size-buffers=10"
+              "         max-size-bytes=0 max-size-time=0"
+           << " ! videoconvert"
+           << " ! video/x-raw,format=I420"
+           << " ! x264enc name=venc tune=zerolatency"
            << " bitrate="     << co.bitrate_kbps
            << " key-int-max=" << co.keyint
            << " bframes=0 speed-preset=ultrafast"
            << " ! video/x-h264,stream-format=byte-stream";
     }
 
-    // config-interval=-1 → inject SPS/PPS before every IDR
-    // ssrc fixed → receiver treats all pipeline instances as the same sender
+    // config-interval=1 → inject SPS/PPS into RTP stream every keyframe interval;
+    // practical choice for receivers that may join mid-stream.
+    // ssrc fixed → receiver treats all pipeline instances as the same sender.
     ss << " ! h264parse name=vsparse"
-       << " ! rtph264pay name=vpay config-interval=-1"
+       << " ! rtph264pay name=vpay config-interval=1"
           " ssrc=987654321 pt=96 mtu=1400";
 
     // ----- Transport sink -----
@@ -176,9 +188,11 @@ std::string CapturePipeline::build_pipeline_str() const {
 // 4. Fire bbox callback (ZMQ send)
 // ---------------------------------------------------------------------------
 GstFlowReturn CapturePipeline::on_new_sample(GstAppSink* sink, gpointer data) {
-    // Record the wall-clock time as early as possible — this is the "frame enters
-    // processing" timestamp used for end-to-end latency measurement on the render side.
-    const uint64_t capture_ts = ds_realtime_us();
+    // Record both clocks as early as possible.
+    // capture_ts (real-time): cross-node E2E latency via SEI embedding.
+    // appsink_mono_ts (monotonic): intra-node appsink branch timing.
+    const uint64_t capture_ts      = ds_realtime_us();
+    const uint64_t appsink_mono_ts = ds_mono_us();
 
     auto* self = static_cast<CapturePipeline*>(data);
 
@@ -223,6 +237,8 @@ GstFlowReturn CapturePipeline::on_new_sample(GstAppSink* sink, gpointer data) {
     msg.frame_seq        = self->m_frame_seq.fetch_add(1, std::memory_order_relaxed);
     msg.capture_ts_us    = capture_ts;  // set at callback entry — before tracker cost
     msg.send_ts_us       = 0;           // filled just before ZMQ send
+    msg.src_width        = static_cast<uint32_t>(W);
+    msg.src_height       = static_cast<uint32_t>(H);
     msg.bbox_count       = 0;
 
     // Store PTS → {capture_ts, frame_seq} so sei_inject_probe_cb can embed them
@@ -237,6 +253,30 @@ GstFlowReturn CapturePipeline::on_new_sample(GstAppSink* sink, gpointer data) {
     }
 
     const uint32_t stats_en = self->m_cfg.debug.stats_interval_s;
+
+    // Appsink branch latency: tee → appsink callback entry.
+    // Read tee-exit timestamp for this PTS (written by tee_sink_probe_cb).
+    // Do NOT clear the entry here — enc_sink_probe_cb clears it on the encode side.
+    if (stats_en && GST_BUFFER_PTS_IS_VALID(buf)) {
+        const GstClockTime pts = GST_BUFFER_PTS(buf);
+        uint64_t t_tee = 0;
+        {
+            std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
+            for (auto& e : self->m_tee_ts_map) {
+                if (e.pts == pts && e.t_tee_us != 0) {
+                    t_tee = e.t_tee_us;
+                    break;
+                }
+            }
+        }
+        if (t_tee != 0) {
+            const uint64_t lat = appsink_mono_ts - t_tee;
+            if (lat < 2000000ULL) {
+                std::lock_guard<std::mutex> lk(self->m_timing_mtx);
+                self->m_appsink_branch_stats.record(lat);
+            }
+        }
+    }
 
     for (size_t ti = 0; ti < self->m_trackers.size() && ti < kMaxTrackers; ++ti) {
         const uint64_t t0 = stats_en ? ds_mono_us() : 0;
@@ -265,8 +305,9 @@ GstFlowReturn CapturePipeline::on_new_sample(GstAppSink* sink, gpointer data) {
         self->m_bbox_cb(msg);
     }
 
-    DS_TRACE("CapturePipeline: frame seq=%" PRIu64 " bboxes=%u\n",
-             msg.frame_seq, msg.bbox_count);
+    DS_TRACE("CapturePipeline: appsink seq=%" PRIu64
+             " bboxes=%u capture_ts=%" PRIu64 " us\n",
+             msg.frame_seq, msg.bbox_count, msg.capture_ts_us);
 
     return GST_FLOW_OK;
 }
@@ -318,57 +359,104 @@ gboolean CapturePipeline::bus_callback(GstBus* /*bus*/, GstMessage* msg, gpointe
 }
 
 // ---------------------------------------------------------------------------
-// Pad probe callbacks — encoder latency measurement
+// Pad probe callbacks — pipeline latency measurement
 // ---------------------------------------------------------------------------
 
-// venc sink pad → record entry timestamp (scalar overwrite — see fileSource for rationale)
-GstPadProbeReturn CapturePipeline::enc_sink_probe_cb(GstPad*, GstPadProbeInfo*,
-                                                     gpointer udata) {
+// "vconv" (first videoconvert) sink pad — record the moment a decoded/captured
+// frame enters the pre-tee processing chain.
+GstPadProbeReturn CapturePipeline::vconv_sink_probe_cb(GstPad*, GstPadProbeInfo*,
+                                                        gpointer udata) {
     auto* self = static_cast<CapturePipeline*>(udata);
     const uint64_t ts = ds_mono_us();
     std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    self->m_enc_in_ts = ts;
+    self->m_pretee_in_ts = ts;
     return GST_PAD_PROBE_OK;
 }
 
-// venc src pad → compute encode latency (skip HEADER/SPS/PPS buffers)
+// "t" (tee) sink pad — compute pre-tee latency; seed the tee-ts map so that
+// both downstream branches can measure their own path latency from the same origin.
+GstPadProbeReturn CapturePipeline::tee_sink_probe_cb(GstPad*, GstPadProbeInfo* info,
+                                                      gpointer udata) {
+    auto* self = static_cast<CapturePipeline*>(udata);
+    const uint64_t now = ds_mono_us();
+
+    // Pre-tee latency: vconv sink → tee sink (decode, colorconv, scale, rate)
+    {
+        std::lock_guard<std::mutex> lk(self->m_timing_mtx);
+        if (self->m_pretee_in_ts != 0) {
+            const uint64_t lat = now - self->m_pretee_in_ts;
+            if (lat < 2000000ULL) self->m_pretee_stats.record(lat);
+            self->m_pretee_in_ts = 0;
+        }
+    }
+
+    // Seed tee-exit timestamp keyed by PTS for per-branch latency.
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (buf && GST_BUFFER_PTS_IS_VALID(buf)) {
+        std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
+        auto& slot = self->m_tee_ts_map[self->m_tee_ts_map_head % kTeeTsMapSize];
+        slot.pts      = GST_BUFFER_PTS(buf);
+        slot.t_tee_us = now;
+        ++self->m_tee_ts_map_head;
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+// venc sink pad — push encoder entry timestamp into FIFO; also compute encode-branch
+// queue latency (tee → encoder entry) and clear the tee-ts map entry.
+GstPadProbeReturn CapturePipeline::enc_sink_probe_cb(GstPad*, GstPadProbeInfo* info,
+                                                     gpointer udata) {
+    auto* self = static_cast<CapturePipeline*>(udata);
+    const uint64_t ts = ds_mono_us();
+
+    uint64_t enc_branch_lat = 0;
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (buf && GST_BUFFER_PTS_IS_VALID(buf)) {
+        const GstClockTime pts = GST_BUFFER_PTS(buf);
+        std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
+        for (auto& e : self->m_tee_ts_map) {
+            if (e.pts == pts && e.t_tee_us != 0) {
+                const uint64_t lat = ts - e.t_tee_us;
+                if (lat < 2000000ULL) enc_branch_lat = lat;
+                e.t_tee_us = 0;
+                break;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(self->m_timing_mtx);
+    if (enc_branch_lat) self->m_enc_branch_stats.record(enc_branch_lat);
+    // Push entry timestamp into FIFO for enc_src_probe_cb to consume
+    auto& slot = self->m_enc_fifo[self->m_enc_fifo_head % kEncFifoSize];
+    slot.ts   = ts;
+    slot.used = true;
+    ++self->m_enc_fifo_head;
+    return GST_PAD_PROBE_OK;
+}
+
+// venc src pad — pop oldest enc_fifo entry, record encode duration.
+// Skip HEADER (SPS/PPS) buffers — they have no corresponding enc_sink entry.
 GstPadProbeReturn CapturePipeline::enc_src_probe_cb(GstPad*, GstPadProbeInfo* info,
                                                     gpointer udata) {
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
     if (buf && GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_HEADER))
-        return GST_PAD_PROBE_OK; // SPS/PPS — timing irrelevant
+        return GST_PAD_PROBE_OK;
 
     auto* self = static_cast<CapturePipeline*>(udata);
     const uint64_t now = ds_mono_us();
     std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    if (self->m_enc_in_ts != 0) {
-        const uint64_t lat = now - self->m_enc_in_ts;
-        if (lat < 2000000ULL) self->m_enc_stats.record(lat);
-        self->m_enc_in_ts = 0;
-    }
-    self->m_enc_out_ts = now;
-    return GST_PAD_PROBE_OK;
-}
-
-// vpay src pad → compute RTP packetise latency (throttled logging every 1 s)
-GstPadProbeReturn CapturePipeline::pay_src_probe_cb(GstPad*, GstPadProbeInfo* info,
-                                                    gpointer udata) {
-    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!buf || !GST_BUFFER_PTS_IS_VALID(buf)) return GST_PAD_PROBE_OK;
-
-    auto* self = static_cast<CapturePipeline*>(udata);
-    const uint64_t now = ds_mono_us();
-    std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    if (self->m_enc_out_ts != 0) {
-        const uint64_t lat = now - self->m_enc_out_ts;
-        if (lat < 2000000ULL) self->m_pay_stats.record(lat);
-        self->m_enc_out_ts = 0;
+    for (auto& e : self->m_enc_fifo) {
+        if (e.used) {
+            const uint64_t lat = now - e.ts;
+            if (lat < 2000000ULL) self->m_enc_stats.record(lat);
+            e.used = false;
+            break;
+        }
     }
     return GST_PAD_PROBE_OK;
 }
 
-// h264parse src pad — prepend a VisionBridge SEI NAL carrying {capture_ts_us, frame_seq}.
-// The SEI rides through RTP/UDP unchanged and is extracted by sei_extract_probe_cb on
+// h264parse src pad — prepend a VisionBridge SEI NAL carrying {capture_ts_us, frame_seq}.// The SEI rides through RTP/UDP unchanged and is extracted by sei_extract_probe_cb on
 // the render side, enabling in-band E2E latency measurement without a shared clock.
 GstPadProbeReturn CapturePipeline::sei_inject_probe_cb(GstPad*, GstPadProbeInfo* info,
                                                        gpointer udata) {
@@ -421,49 +509,62 @@ GstPadProbeReturn CapturePipeline::sei_inject_probe_cb(GstPad*, GstPadProbeInfo*
     // Replace buffer in probe info (release original's ref, hand new_buf ref to probe)
     gst_buffer_unref(orig);
     GST_PAD_PROBE_INFO_DATA(info) = new_buf;
+
+    DS_TRACE("CapturePipeline: SEI inject seq=%" PRIu64
+             " capture_ts=%" PRIu64 " us\n", frame_seq, capture_ts);
     return GST_PAD_PROBE_OK;
 }
 
 // ---------------------------------------------------------------------------
-// print_timing_stats — called by 1-second GLib timer
+// emit_periodic_stats — called by 1-second GLib timer
 // ---------------------------------------------------------------------------
-void CapturePipeline::print_timing_stats() {
-    LatencyStats enc_snap, pay_snap;
+void CapturePipeline::emit_periodic_stats() {
+    LatencyStats pretee_snap, appsink_br_snap, enc_br_snap, enc_snap;
     LatencyStats trk_snap[kMaxTrackers];
-    bool have_enc = false, have_pay = false;
+    bool have_pretee = false, have_appsink_br = false,
+         have_enc_br = false, have_enc = false;
     bool have_trk[kMaxTrackers]{};
     {
         std::lock_guard<std::mutex> lk(m_timing_mtx);
-        if (!m_enc_stats.empty()) { enc_snap = m_enc_stats.reset_and_return(); have_enc = true; }
-        if (!m_pay_stats.empty()) { pay_snap = m_pay_stats.reset_and_return(); have_pay = true; }
+        if (!m_pretee_stats.empty())         { pretee_snap     = m_pretee_stats.reset_and_return();          have_pretee     = true; }
+        if (!m_appsink_branch_stats.empty()) { appsink_br_snap = m_appsink_branch_stats.reset_and_return();  have_appsink_br = true; }
+        if (!m_enc_branch_stats.empty())     { enc_br_snap     = m_enc_branch_stats.reset_and_return();      have_enc_br     = true; }
+        if (!m_enc_stats.empty())            { enc_snap        = m_enc_stats.reset_and_return();             have_enc        = true; }
         for (int i = 0; i < kMaxTrackers; ++i) {
             if (!m_tracker_stats[i].empty()) {
-                trk_snap[i]  = m_tracker_stats[i].reset_and_return();
-                have_trk[i]  = true;
+                trk_snap[i] = m_tracker_stats[i].reset_and_return();
+                have_trk[i] = true;
             }
         }
     }
 
-    if (have_enc)
-        DS_INFO("[TIMING-SRC] encode:    cnt=%" PRIu64
-                " avg=%.0f min=%" PRIu64 " max=%" PRIu64 " us\n",
-                enc_snap.count, enc_snap.avg_us(),
-                enc_snap.min_us, enc_snap.max_us);
+    // Build single message string so everything emits under one log timestamp.
+    char line[256];
+    std::string msg = "[TIMING-SRC]\n";
 
-    if (have_pay)
-        DS_INFO("[TIMING-SRC] rtp_pay:   cnt=%" PRIu64
-                " avg=%.0f min=%" PRIu64 " max=%" PRIu64 " us\n",
-                pay_snap.count, pay_snap.avg_us(),
-                pay_snap.min_us, pay_snap.max_us);
+    auto append = [&](const char* tag, const LatencyStats& s) {
+        snprintf(line, sizeof(line),
+                 "  %-18s  avg=%6.0f  std=%5.0f  min=%6" PRIu64 "  max=%6" PRIu64
+                 "  us  (n=%" PRIu64 ")\n",
+                 tag, s.avg_us(), s.stddev_us(), s.min_us, s.max_us, s.count);
+        msg += line;
+    };
+
+    if (have_pretee)     append("pretee",         pretee_snap);
+    if (have_appsink_br) append("appsink_branch", appsink_br_snap);
+    if (have_enc_br)     append("enc_branch",     enc_br_snap);
+    if (have_enc)        append("encode",         enc_snap);
 
     for (size_t i = 0; i < m_trackers.size() && i < kMaxTrackers; ++i) {
-        if (have_trk[i])
-            DS_INFO("[TIMING-SRC] tracker[%s]: cnt=%" PRIu64
-                    " avg=%.0f min=%" PRIu64 " max=%" PRIu64 " us\n",
-                    m_trackers[i]->name(),
-                    trk_snap[i].count, trk_snap[i].avg_us(),
-                    trk_snap[i].min_us, trk_snap[i].max_us);
+        if (have_trk[i]) {
+            char tag[32];
+            snprintf(tag, sizeof(tag), "tracker[%s]", m_trackers[i]->name());
+            append(tag, trk_snap[i]);
+        }
     }
+
+    if (msg.size() > sizeof("[TIMING-SRC]\n") - 1)
+        DS_INFO("%s", msg.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +574,7 @@ void CapturePipeline::gst_thread_func() {
     if (m_cfg.debug.stats_interval_s > 0) {
         m_timing_timer_id = g_timeout_add_seconds(m_cfg.debug.stats_interval_s,
             [](gpointer data) -> gboolean {
-                static_cast<CapturePipeline*>(data)->print_timing_stats();
+                static_cast<CapturePipeline*>(data)->emit_periodic_stats();
                 return G_SOURCE_CONTINUE;
             }, this);
     }
@@ -539,29 +640,43 @@ bool CapturePipeline::start() {
 
     // Attach timing probes only when stats are enabled
     if (m_cfg.debug.stats_interval_s > 0) {
-        m_encoder   = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
-        m_rtph264pay = gst_bin_get_by_name(GST_BIN(m_pipeline), "vpay");
+        m_vconv_first = gst_bin_get_by_name(GST_BIN(m_pipeline), "vconv");
+        m_tee         = gst_bin_get_by_name(GST_BIN(m_pipeline), "t");
+        m_encoder     = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
+
+        if (m_vconv_first) {
+            GstPad* snk = gst_element_get_static_pad(m_vconv_first, "sink");
+            if (snk) {
+                m_vconv_sink_probe_id = gst_pad_add_probe(snk,
+                    GST_PAD_PROBE_TYPE_BUFFER, vconv_sink_probe_cb, this, nullptr);
+                gst_object_unref(snk);
+            }
+        } else {
+            DS_WARN("CapturePipeline: 'vconv' element not found — pre-tee timing disabled\n");
+        }
+
+        if (m_tee) {
+            GstPad* snk = gst_element_get_static_pad(m_tee, "sink");
+            if (snk) {
+                m_tee_sink_probe_id = gst_pad_add_probe(snk,
+                    GST_PAD_PROBE_TYPE_BUFFER, tee_sink_probe_cb, this, nullptr);
+                gst_object_unref(snk);
+            }
+        } else {
+            DS_WARN("CapturePipeline: tee element 't' not found — branch timing disabled\n");
+        }
 
         if (m_encoder) {
             GstPad* snk = gst_element_get_static_pad(m_encoder, "sink");
-            GstPad* src = gst_element_get_static_pad(m_encoder, "src");
             if (snk) {
                 m_enc_sink_probe_id = gst_pad_add_probe(snk,
                     GST_PAD_PROBE_TYPE_BUFFER, enc_sink_probe_cb, this, nullptr);
                 gst_object_unref(snk);
             }
+            GstPad* src = gst_element_get_static_pad(m_encoder, "src");
             if (src) {
                 m_enc_src_probe_id = gst_pad_add_probe(src,
                     GST_PAD_PROBE_TYPE_BUFFER, enc_src_probe_cb, this, nullptr);
-                gst_object_unref(src);
-            }
-        }
-
-        if (m_rtph264pay) {
-            GstPad* src = gst_element_get_static_pad(m_rtph264pay, "src");
-            if (src) {
-                m_pay_src_probe_id = gst_pad_add_probe(src,
-                    GST_PAD_PROBE_TYPE_BUFFER, pay_src_probe_cb, this, nullptr);
                 gst_object_unref(src);
             }
         }
@@ -607,10 +722,11 @@ void CapturePipeline::stop() {
             probe_id = 0;
         }
     };
-    remove_probe(m_h264parse,  "src",  m_sei_inject_probe_id);
-    remove_probe(m_encoder,    "sink", m_enc_sink_probe_id);
-    remove_probe(m_encoder,    "src",  m_enc_src_probe_id);
-    remove_probe(m_rtph264pay, "src",  m_pay_src_probe_id);
+    remove_probe(m_vconv_first, "sink", m_vconv_sink_probe_id);
+    remove_probe(m_tee,         "sink", m_tee_sink_probe_id);
+    remove_probe(m_h264parse,   "src",  m_sei_inject_probe_id);
+    remove_probe(m_encoder,     "sink", m_enc_sink_probe_id);
+    remove_probe(m_encoder,     "src",  m_enc_src_probe_id);
 
     if (m_timing_timer_id) {
         g_source_remove(m_timing_timer_id);
@@ -622,10 +738,11 @@ void CapturePipeline::stop() {
     if (m_loop) g_main_loop_quit(m_loop);
     if (m_gst_thread.joinable()) m_gst_thread.join();
 
-    if (m_h264parse)  { gst_object_unref(m_h264parse);  m_h264parse  = nullptr; }
-    if (m_encoder)    { gst_object_unref(m_encoder);    m_encoder    = nullptr; }
-    if (m_rtph264pay) { gst_object_unref(m_rtph264pay); m_rtph264pay = nullptr; }
-    if (m_appsink)    { gst_object_unref(m_appsink);    m_appsink    = nullptr; }
+    if (m_vconv_first){ gst_object_unref(m_vconv_first); m_vconv_first = nullptr; }
+    if (m_tee)        { gst_object_unref(m_tee);         m_tee         = nullptr; }
+    if (m_h264parse)  { gst_object_unref(m_h264parse);   m_h264parse   = nullptr; }
+    if (m_encoder)    { gst_object_unref(m_encoder);     m_encoder     = nullptr; }
+    if (m_appsink)    { gst_object_unref(m_appsink);     m_appsink     = nullptr; }
     gst_object_unref(m_pipeline); m_pipeline = nullptr;
     if (m_loop) { g_main_loop_unref(m_loop); m_loop = nullptr; }
 

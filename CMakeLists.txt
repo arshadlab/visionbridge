@@ -37,6 +37,42 @@ find_package(SDL2 REQUIRED)
 
 pkg_check_modules(ZMQ REQUIRED libzmq)
 
+# EGL / GBM / DRM (for --backend egl)
+pkg_check_modules(EGL    QUIET egl)
+pkg_check_modules(GLESV2 QUIET glesv2)
+pkg_check_modules(GBM    QUIET gbm)
+pkg_check_modules(LIBDRM QUIET libdrm)
+if(EGL_FOUND AND GLESV2_FOUND AND GBM_FOUND AND LIBDRM_FOUND)
+    set(HAVE_EGL TRUE)
+    message(STATUS "visionbridge: EGL/KMS backend enabled")
+else()
+    message(STATUS "visionbridge: EGL/KMS backend disabled (missing egl/glesv2/gbm/libdrm)")
+endif()
+
+# Wayland EGL (for --backend wayland)
+pkg_check_modules(WAYLAND_CLIENT   QUIET wayland-client)
+pkg_check_modules(WAYLAND_EGL      QUIET wayland-egl)
+pkg_check_modules(WAYLAND_PROTOS   QUIET wayland-protocols)
+find_program(WAYLAND_SCANNER wayland-scanner)
+if(HAVE_EGL AND WAYLAND_CLIENT_FOUND AND WAYLAND_EGL_FOUND AND WAYLAND_PROTOS_FOUND AND WAYLAND_SCANNER)
+    set(HAVE_WAYLAND_EGL TRUE)
+    # Generate xdg-shell protocol sources
+    execute_process(COMMAND pkg-config --variable=pkgdatadir wayland-protocols
+        OUTPUT_VARIABLE WP_DATADIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(XDG_SHELL_XML "${WP_DATADIR}/stable/xdg-shell/xdg-shell.xml")
+    add_custom_command(OUTPUT
+        "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h"
+        COMMAND ${WAYLAND_SCANNER} client-header ${XDG_SHELL_XML}
+                "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h")
+    add_custom_command(OUTPUT
+        "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c"
+        COMMAND ${WAYLAND_SCANNER} private-code ${XDG_SHELL_XML}
+                "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c")
+    message(STATUS "visionbridge: Wayland EGL backend enabled")
+else()
+    message(STATUS "visionbridge: Wayland EGL backend disabled")
+endif()
+
 # OpenCV
 find_package(OpenCV REQUIRED COMPONENTS core imgproc video)
 find_package(OpenCV QUIET  COMPONENTS dnn)
@@ -115,14 +151,15 @@ target_compile_options(visionbridge_source PRIVATE -Wall -Wextra)
 # ---------------------------------------------------------------------------
 # visionbridge_render
 # ---------------------------------------------------------------------------
-add_executable(visionbridge_render
+set(RENDER_SOURCES
     render/main.cpp
     render/render_node.cpp
     render/stream_decoder.cpp
-    render/display_output.cpp
+    render/display_output_base.cpp
+    render/display_output_sdl.cpp
 )
-
-target_include_directories(visionbridge_render PRIVATE
+set(RENDER_DEFINES)
+set(RENDER_INCLUDES
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/render
     ${GSTREAMER_INCLUDE_DIRS}
@@ -133,19 +170,41 @@ target_include_directories(visionbridge_render PRIVATE
     ${SDL2_INCLUDE_DIRS}
     ${NLOHMANN_JSON_INCLUDE_DIR}
 )
-
-target_link_libraries(visionbridge_render PRIVATE
+set(RENDER_LIBS
     ds_common
-    ${GSTREAMER_LIBRARIES}
-    ${GSTREAMER_APP_LIBRARIES}
-    ${GSTREAMER_VIDEO_LIBRARIES}
-    ${GSTREAMER_RTP_LIBRARIES}
-    ${ZMQ_LIBRARIES}
-    ${SDL2_LIBRARIES}
-    pthread
-    rt
+    ${GSTREAMER_LIBRARIES} ${GSTREAMER_APP_LIBRARIES}
+    ${GSTREAMER_VIDEO_LIBRARIES} ${GSTREAMER_RTP_LIBRARIES}
+    ${ZMQ_LIBRARIES} ${SDL2_LIBRARIES}
+    pthread rt
 )
 
+if(HAVE_EGL)
+    list(APPEND RENDER_SOURCES render/display_output_egl.cpp)
+    list(APPEND RENDER_DEFINES HAVE_EGL=1)
+    list(APPEND RENDER_INCLUDES ${EGL_INCLUDE_DIRS} ${GLESV2_INCLUDE_DIRS}
+                                ${GBM_INCLUDE_DIRS} ${LIBDRM_INCLUDE_DIRS})
+    list(APPEND RENDER_LIBS ${EGL_LIBRARIES} ${GLESV2_LIBRARIES}
+                            ${GBM_LIBRARIES} ${LIBDRM_LIBRARIES})
+endif()
+
+if(HAVE_WAYLAND_EGL)
+    list(APPEND RENDER_SOURCES
+        render/display_output_wl_egl.cpp
+        "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h"
+    )
+    list(APPEND RENDER_DEFINES HAVE_WAYLAND_EGL=1)
+    list(APPEND RENDER_INCLUDES
+        ${WAYLAND_CLIENT_INCLUDE_DIRS} ${WAYLAND_EGL_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_BINARY_DIR})
+    list(APPEND RENDER_LIBS
+        ${WAYLAND_CLIENT_LIBRARIES} ${WAYLAND_EGL_LIBRARIES})
+endif()
+
+add_executable(visionbridge_render ${RENDER_SOURCES})
+target_include_directories(visionbridge_render PRIVATE ${RENDER_INCLUDES})
+target_link_libraries(visionbridge_render PRIVATE ${RENDER_LIBS})
+target_compile_definitions(visionbridge_render PRIVATE ${RENDER_DEFINES})
 target_compile_options(visionbridge_render PRIVATE -Wall -Wextra)
 
 # ---------------------------------------------------------------------------

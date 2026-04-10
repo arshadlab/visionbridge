@@ -68,7 +68,7 @@ int main(int argc, char* argv[]) {
     bool dest_set   = false;
     bool mcast_set  = false;
     int  loop_override = -1;    // -1 = not set, 0 = no-loop, 1 = loop
-    int log_level = 2; // INFO
+    int log_level = -1; // -1 = not set by CLI; will fall back to config value
 
     static const struct option long_opts[] = {
         {"config",    required_argument, nullptr, 'c'},
@@ -116,7 +116,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    ds_set_log_level(static_cast<LogLevel>(log_level));
+    // Apply CLI log level early so config-load messages are visible at the right level.
+    // Default to INFO if not set by CLI yet (config may override below).
+    if (log_level >= 0) ds_set_log_level(static_cast<LogLevel>(log_level));
+    else                ds_set_log_level(LogLevel::INFO);
 
     DsSourceConfig cfg;
     if (!ConfigLoader::load_source(config_path, cfg)) {
@@ -152,12 +155,14 @@ int main(int argc, char* argv[]) {
                 cfg.transport.host.c_str(), cfg.transport.rtp_port);
     }
 
-    ds_set_log_level(static_cast<LogLevel>(cfg.debug.log_level));
+    // Apply final log level: CLI takes priority over config JSON value.
+    if (log_level < 0) ds_set_log_level(static_cast<LogLevel>(cfg.debug.log_level));
 
     DS_INFO("visionbridge-source starting\n");
     DS_INFO("  input:     %s (%s)\n",
             cfg.input.type.c_str(),
             cfg.input.type == "file" ? cfg.input.file.c_str() : cfg.input.device.c_str());
+    DS_INFO("  appsink:   sync=%s\n", cfg.appsink_sync ? "true (real-time throttle)" : "false");
     DS_INFO("  transport: %s %s:%u\n",
             cfg.transport.multicast ? "[MULTICAST]" : "[UNICAST]",
             cfg.transport.host.c_str(), cfg.transport.rtp_port);

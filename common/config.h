@@ -129,6 +129,17 @@ struct DsRenderConfig {
     std::string display_title  = "VisionBridge";
     bool        fullscreen     = false;
     int         sdl_display_index = -1; ///< -1 = primary display
+
+    /// Display backend: "sdl" | "egl" | "wayland"
+    /// sdl     — SDL2 window (default; works with any compositor)
+    /// egl     — EGL/DRM direct KMS (best accuracy; compositor must not hold DRM master)
+    /// wayland — Wayland EGL fullscreen surface (no DRM master needed)
+    std::string backend = "sdl";
+
+    /// EGL/DRM: path to DRM device node (empty = auto-detect /dev/dri/card*)
+    std::string drm_device;
+    /// EGL/DRM: CRTC/connector index (0 = first connected output)
+    int         drm_output_index = 0;
 };
 
 #endif // VISIONBRIDGE_CONFIG_H

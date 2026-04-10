@@ -24,12 +24,15 @@
     "jitter_buffer_ms": 20,
 
     "display": {
+        "backend":           "sdl",
         "width":             1280,
         "height":            720,
         "fps":               30,
         "title":             "VisionBridge",
         "fullscreen":        false,
-        "sdl_display_index": -1
+        "sdl_display_index": -1,
+        "drm_device":        "",
+        "drm_output_index":  2
     },
 
     "debug": {

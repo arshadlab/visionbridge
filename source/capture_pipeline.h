@@ -104,34 +104,37 @@ private:
     static gboolean        bus_callback (GstBus* bus, GstMessage* msg, gpointer data);
 
     // ---- Pad probe callbacks (all return GST_PAD_PROBE_OK) ----
+    static GstPadProbeReturn vconv_sink_probe_cb (GstPad*, GstPadProbeInfo*, gpointer); ///< pre-tee start
+    static GstPadProbeReturn tee_sink_probe_cb   (GstPad*, GstPadProbeInfo*, gpointer); ///< pre-tee end + branch seed
     static GstPadProbeReturn enc_sink_probe_cb   (GstPad*, GstPadProbeInfo*, gpointer);
-    static GstPadProbeReturn enc_src_probe_cb    (GstPad*, GstPadProbeInfo*, gpointer);
-    static GstPadProbeReturn pay_src_probe_cb    (GstPad*, GstPadProbeInfo*, gpointer);
+    static GstPadProbeReturn enc_src_probe_cb    (GstPad*, GstPadProbeInfo*, gpointer); ///< encoder output
     static GstPadProbeReturn sei_inject_probe_cb (GstPad*, GstPadProbeInfo*, gpointer);
 
     // ---- GLib main loop thread ----
     void gst_thread_func();
 
     // ---- Timing stats printer (called by GLib timer) ----
-    void print_timing_stats();
+    void emit_periodic_stats();
 
     // ---- Members ----
     DsSourceConfig m_cfg;
     std::vector<std::unique_ptr<ITracker>> m_trackers;
     BboxCallback m_bbox_cb;
 
-    GstElement* m_pipeline   = nullptr;
-    GstElement* m_appsink    = nullptr;
-    GstElement* m_encoder    = nullptr; ///< "venc" (x264enc or vaapih264enc)
-    GstElement* m_h264parse  = nullptr; ///< "vsparse" (source h264parse, SEI inject)
-    GstElement* m_rtph264pay = nullptr; ///< "vpay"
-    GMainLoop*  m_loop       = nullptr;
+    GstElement* m_pipeline    = nullptr;
+    GstElement* m_appsink     = nullptr;
+    GstElement* m_encoder     = nullptr; ///< "venc"   (x264enc or vaapih264enc)
+    GstElement* m_h264parse   = nullptr; ///< "vsparse" (source h264parse, SEI inject)
+    GstElement* m_vconv_first = nullptr; ///< "vconv"  (first videoconvert, pre-tee start)
+    GstElement* m_tee         = nullptr; ///< "t"      (tee element, pre-tee end)
+    GMainLoop*  m_loop        = nullptr;
     std::thread m_gst_thread;
 
     // Probe IDs (removed before GST_STATE_NULL)
+    gulong m_vconv_sink_probe_id = 0; ///< vconv sink — pre-tee start
+    gulong m_tee_sink_probe_id   = 0; ///< tee sink   — pre-tee end / branch-ts seed
     gulong m_enc_sink_probe_id   = 0;
-    gulong m_enc_src_probe_id    = 0;
-    gulong m_pay_src_probe_id    = 0;
+    gulong m_enc_src_probe_id    = 0; ///< encoder output — encode duration
     gulong m_sei_inject_probe_id = 0; ///< SEI timestamp inject on h264parse src
     guint  m_timing_timer_id     = 0;
 
@@ -141,13 +144,33 @@ private:
 
     // ---- Timing state (protected by m_timing_mtx) ----
     mutable std::mutex  m_timing_mtx;
-    uint64_t            m_enc_in_ts = 0;    ///< encoder entry timestamp (overwrite)
-    uint64_t            m_enc_out_ts = 0;   ///< encoder exit timestamp (overwrite)
-    LatencyStats        m_enc_stats;        ///< pure encode latency  (venc sink→src)
-    LatencyStats        m_pay_stats;        ///< RTP pay latency      (venc src→vpay src)
+    uint64_t            m_pretee_in_ts = 0;      ///< vconv sink stamp (single-slot, linear path)
+    LatencyStats        m_pretee_stats;          ///< vconv sink → tee sink (decode/convert/scale/rate)
+    LatencyStats        m_appsink_branch_stats;  ///< tee → appsink callback (tracker branch)
+    LatencyStats        m_enc_branch_stats;      ///< tee → encoder sink    (encode branch queue)
+    LatencyStats        m_enc_stats;             ///< encoder sink → encoder src (encode duration)
     // Per-tracker latency stats; indexed by tracker position in m_trackers
     static constexpr int kMaxTrackers = 4;
     LatencyStats        m_tracker_stats[kMaxTrackers];
+
+    // FIFO ring for encoder entry timestamps (push at enc_sink, pop at enc_src).
+    // Sized to cover the encoder's max in-flight depth.
+    static constexpr int kEncFifoSize = 16;
+    struct EncFifoEntry { uint64_t ts = 0; bool used = false; };
+    EncFifoEntry m_enc_fifo[kEncFifoSize]{};
+    size_t       m_enc_fifo_head = 0;
+
+    // ---- Tee-exit PTS timestamps for per-branch latency (protected by m_tee_ts_mtx) ----
+    // Written by tee_sink_probe_cb; read (not cleared) by on_new_sample for appsink-branch
+    // latency; read and cleared by enc_sink_probe_cb for encode-branch latency.
+    struct TeeTsEntry {
+        GstClockTime pts      = GST_CLOCK_TIME_NONE;
+        uint64_t     t_tee_us = 0; ///< 0 = empty slot
+    };
+    static constexpr int kTeeTsMapSize = 16;
+    TeeTsEntry         m_tee_ts_map[kTeeTsMapSize]{};
+    size_t             m_tee_ts_map_head = 0;
+    mutable std::mutex m_tee_ts_mtx;
 
     // ---- SEI PTS correlation map (protected by m_sei_map_mtx) ----
     // Written from the appsink callback; consumed by sei_inject_probe_cb.

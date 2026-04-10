@@ -8,9 +8,10 @@
 
 #include "../common/config.h"
 #include "stream_decoder.h"
-#include "display_output.h"
+#include "display_output_base.h"
 
 #include <atomic>
+#include <memory>
 
 class RenderNode {
 public:
@@ -31,8 +32,10 @@ public:
 private:
     const DsRenderConfig& m_cfg;
 
-    StreamDecoder  m_decoder;
-    DisplayOutput  m_display;
+    StreamDecoder              m_decoder;
+    std::unique_ptr<IDisplayOutput> m_display;
 
     bool m_initialized = false;
+
+    static std::unique_ptr<IDisplayOutput> make_backend(const DsRenderConfig& cfg);
 };

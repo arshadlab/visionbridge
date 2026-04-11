@@ -191,16 +191,41 @@ GstFlowReturn StreamDecoder::on_new_sample(GstAppSink* sink, gpointer data) {
     gst_buffer_unmap(buf, &map);
     gst_sample_unref(sample);
 
-    // Stamp frame with SEI data matched by PTS (precise per-frame correlation)
-    if (GST_BUFFER_PTS_IS_VALID(buf)) {
-        const GstClockTime pts = GST_BUFFER_PTS(buf);
+    // Stamp frame with SEI data matched by PTS (precise per-frame correlation).
+    // Falls back to oldest-unconsumed FIFO entry when the PTS domain differs
+    // (jitterbuffer or h264parse timestamp shift).  Safe because bframes=0
+    // guarantees decode order == display order.
+    {
         std::lock_guard<std::mutex> lk(self->m_sei_mtx);
-        for (auto& e : self->m_sei_map) {
-            if (e.pts == pts && e.capture_ts_us != 0) {
-                frame->sei_capture_ts_us = e.capture_ts_us;
-                frame->sei_frame_seq     = e.frame_seq;
-                e.capture_ts_us = 0; // consume
-                break;
+
+        // 1. Exact PTS match (ideal path)
+        if (GST_BUFFER_PTS_IS_VALID(buf)) {
+            const GstClockTime pts = GST_BUFFER_PTS(buf);
+            for (auto& e : self->m_sei_map) {
+                if (e.pts == pts && e.capture_ts_us != 0) {
+                    frame->sei_capture_ts_us = e.capture_ts_us;
+                    frame->sei_frame_seq     = e.frame_seq;
+                    e.capture_ts_us = 0; // consume
+                    break;
+                }
+            }
+        }
+
+        // 2. FIFO fallback: PTS domain mismatch (jitterbuffer / h264parse shift).
+        //    Pick oldest unconsumed entry — correct for bframes=0 in-order decode.
+        if (frame->sei_frame_seq == 0) {
+            SeiMapEntry* oldest = nullptr;
+            for (auto& e : self->m_sei_map) {
+                if (e.capture_ts_us != 0 &&
+                    (!oldest || e.frame_seq < oldest->frame_seq))
+                    oldest = &e;
+            }
+            if (oldest) {
+                frame->sei_capture_ts_us = oldest->capture_ts_us;
+                frame->sei_frame_seq     = oldest->frame_seq;
+                oldest->capture_ts_us    = 0;
+                DS_DBG("StreamDecoder: SEI FIFO fallback → seq=%" PRIu64 "\n",
+                       frame->sei_frame_seq);
             }
         }
     }

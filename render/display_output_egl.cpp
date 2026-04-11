@@ -599,7 +599,16 @@ bool DisplayOutputEgl::present() {
     if (!frame || frame.get() == m_last_frame_ptr)
         return true;
 
-    std::shared_ptr<DsMsgBbox> bbox = m_bbox.best_for_frame(frame.get());
+    // Wait for the matching bbox before rendering.
+    std::shared_ptr<DsMsgBbox> bbox;
+    if (frame->sei_frame_seq != 0) {
+        bbox = m_bbox.wait_for_seq(frame->sei_frame_seq);
+        if (!bbox)
+            DS_ERR("[BBOX-SYNC] timeout waiting for bbox seq=%" PRIu64
+                   " — rendering without overlay\n", frame->sei_frame_seq);
+    } else {
+        bbox = m_bbox.best_for_frame(frame.get());
+    }
 
     glViewport(0, 0,
                static_cast<GLsizei>(m_mode.hdisplay),

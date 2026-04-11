@@ -209,7 +209,18 @@ bool DisplayOutputSdl::present() {
     if (!frame || frame.get() == m_last_frame_ptr)
         return true;
 
-    std::shared_ptr<DsMsgBbox> bbox_msg = m_bbox.best_for_frame(frame.get());
+    // Wait for the matching bbox before rendering.
+    // When SEI seq# is available we can do an exact match with a hard timeout;
+    // without SEI we fall back to the best-available entry (no reliable seq).
+    std::shared_ptr<DsMsgBbox> bbox_msg;
+    if (frame->sei_frame_seq != 0) {
+        bbox_msg = m_bbox.wait_for_seq(frame->sei_frame_seq);
+        if (!bbox_msg)
+            DS_ERR("[BBOX-SYNC] timeout waiting for bbox seq=%" PRIu64
+                   " — rendering without overlay\n", frame->sei_frame_seq);
+    } else {
+        bbox_msg = m_bbox.best_for_frame(frame.get());
+    }
 
     if (frame) {
         if (!m_window_sized) {

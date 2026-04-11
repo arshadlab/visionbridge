@@ -38,7 +38,7 @@ public:
     /// Detect objects in a BGR or BGRA frame.
     /// Each DsBbox must have detector_id set by the implementation.
     /// Returns an empty vector if nothing is detected or the detector is disabled.
-    virtual std::vector<DsBbox> process(const cv::Mat& frame) = 0;
+    virtual std::vector<DsBbox> process(const cv::Mat& frame, uint64_t seq) = 0;
 
     /// Human-readable detector name (used in debug output).
     virtual const char* name() const = 0;

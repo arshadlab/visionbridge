@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <vector>
+#include <unistd.h>
 #include <opencv2/core.hpp>
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -89,52 +90,35 @@ std::string CapturePipeline::build_pipeline_str() const {
     // ----- Input source -----
     if (in.type == "file" && !in.file.empty()) {
         if (co.hw_decode) {
-            // Hardware-decoded path: qtdemux → h264parse → VA-API decoder.
-            // Avoids a full re-encode decode cycle through decodebin; faster and
-            // uses the GPU for decode, leaving CPU free for trackers.
-            ss << "filesrc location=\"" << in.file << "\""
+            ss << "filesrc name=vfsrc location=\"" << in.file << "\""
                << " ! qtdemux name=demux"
                << "  demux.video_0 ! h264parse ! vah264dec";
         } else {
-            ss << "filesrc location=\"" << in.file << "\""
+            ss << "filesrc name=vfsrc location=\"" << in.file << "\""
                << " ! decodebin";
         }
     } else {
-        // Live V4L2 webcam
         ss << "v4l2src device=\"" << in.device << "\"";
     }
 
     // ----- Common format conversion & scaling -----
-    // Only insert videoscale/videorate when an override is actually requested.
     ss << " ! videoconvert name=vconv";
     if (in.width > 0 || in.height > 0)
         ss << " ! videoscale";
     if (in.fps_num > 0)
         ss << " ! videorate";
-    // BGRx: 4-byte-aligned BGR (OpenCV can use directly without copy)
+    // BGRx: 4-byte-aligned BGR (OpenCV reads first 3 channels directly)
     ss << " ! video/x-raw,format=BGRx";
     if (in.width  > 0) ss << ",width="  << in.width;
     if (in.height > 0) ss << ",height=" << in.height;
     if (in.fps_num > 0) ss << ",framerate=" << in.fps_num << "/" << in.fps_den;
-    ss << " ! tee name=t";
 
-    // ----- Tracker/appsink branch -----
-    // leaky=downstream: if appsink is busy (tracker running), drop the incoming
-    // frame rather than blocking the encode branch.
-    ss << "  t. ! queue name=vtrack_q leaky=downstream max-size-buffers=1"
-          "         max-size-bytes=0 max-size-time=0"
-       << " ! appsink name=vsink"
-       << "   sync=" << (m_cfg.appsink_sync ? "true" : "false")
-       << "   emit-signals=true"
-          "   max-buffers=1 drop=true";
-
-    // ----- Encode branch -----
-    // hw path: leaky queue (vaapih264enc is fast; prefer drop over stall) with NV12
-    //          as the native VA-API input format.
-    // sw path: non-leaky queue with 10-buffer headroom for smoother pacing under
-    //          transient x264enc stalls, with explicit I420 cap.
+    // ----- Single linear encode path (no tee, no appsink) -----
+    // venc_q sink pad is probed by vraw_probe_cb: memcpy BGRx frame → shared
+    // FrameSlot, assign seq#, notify executor thread — all in <1 ms so the
+    // streaming thread (and encoder) are not blocked by inference.
     if (co.hw_encode) {
-        ss << "  t. ! queue name=venc_q leaky=downstream max-size-buffers=1"
+        ss << " ! queue name=venc_q leaky=downstream max-size-buffers=2"
               "         max-size-bytes=0 max-size-time=0"
            << " ! videoconvert"
            << " ! video/x-raw,format=NV12"
@@ -144,7 +128,7 @@ std::string CapturePipeline::build_pipeline_str() const {
            << " max-bframes=0 tune=low-power"
            << " ! video/x-h264,stream-format=byte-stream";
     } else {
-        ss << "  t. ! queue name=venc_q max-size-buffers=10"
+        ss << " ! queue name=venc_q max-size-buffers=10"
               "         max-size-bytes=0 max-size-time=0"
            << " ! videoconvert"
            << " ! video/x-raw,format=I420"
@@ -155,161 +139,209 @@ std::string CapturePipeline::build_pipeline_str() const {
            << " ! video/x-h264,stream-format=byte-stream";
     }
 
-    // config-interval=1 → inject SPS/PPS into RTP stream every keyframe interval;
-    // practical choice for receivers that may join mid-stream.
-    // ssrc fixed → receiver treats all pipeline instances as the same sender.
     ss << " ! h264parse name=vsparse"
-       << " ! rtph264pay name=vpay config-interval=1"
+       << " ! rtph264pay name=vpay config-interval=-1"
           " ssrc=987654321 pt=96 mtu=1400";
 
-    // ----- Transport sink -----
-    const char* udp_sync = m_cfg.appsink_sync ? "true" : "false";
     if (tr.multicast) {
         ss << " ! udpsink host=\"" << tr.host << "\""
            << " port=" << tr.rtp_port
-           << " auto-multicast=true sync=" << udp_sync;
+           << " auto-multicast=true sync=true";
         if (!tr.iface.empty())
             ss << " multicast-iface=\"" << tr.iface << "\"";
     } else {
         ss << " ! udpsink host=\"" << tr.host << "\""
            << " port=" << tr.rtp_port
-           << " sync=" << udp_sync;
+           << " sync=true";
     }
 
     return ss.str();
 }
 
 // ---------------------------------------------------------------------------
-// on_new_sample — appsink callback (GStreamer streaming thread)
+// vraw_probe_cb — venc_q sink pad probe (GStreamer streaming thread)
 //
-// 1. Extract BGRx pixel data
-// 2. Run all enabled trackers
-// 3. Aggregate results into DsMsgBbox
-// 4. Fire bbox callback (ZMQ send)
+// Fires for every BGRx frame entering the encoder queue.  Does three things:
+//   1. Assigns a seq# and records capture_ts (real-time clock).
+//   2. Populates the SEI map (PTS → {capture_ts, seq}) for sei_inject_probe_cb.
+//   3. memcpy's the BGRx pixels into m_frame_slot (latest-wins) and signals
+//      the executor thread to run trackers in parallel with the encoder.
+//
+// Returns immediately — the encoder is never blocked by tracker inference.
 // ---------------------------------------------------------------------------
-GstFlowReturn CapturePipeline::on_new_sample(GstAppSink* sink, gpointer data) {
-    // Record both clocks as early as possible.
-    // capture_ts (real-time): cross-node E2E latency via SEI embedding.
-    // appsink_mono_ts (monotonic): intra-node appsink branch timing.
-    const uint64_t capture_ts      = ds_realtime_us();
-    const uint64_t appsink_mono_ts = ds_mono_us();
+GstPadProbeReturn CapturePipeline::vraw_probe_cb(GstPad* pad,
+                                                  GstPadProbeInfo* info,
+                                                  gpointer udata) {
+    auto* self = static_cast<CapturePipeline*>(udata);
 
-    auto* self = static_cast<CapturePipeline*>(data);
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf) return GST_PAD_PROBE_OK;
 
-    GstSample* sample = gst_app_sink_pull_sample(sink);
-    if (!sample) return GST_FLOW_ERROR;
+    const uint64_t capture_ts = ds_realtime_us();
+    const uint64_t now_mono   = ds_mono_us();
+    const uint64_t seq = self->m_frame_seq.fetch_add(1, std::memory_order_relaxed);
 
-    GstBuffer* buf  = gst_sample_get_buffer(sample);
-    GstCaps*   caps = gst_sample_get_caps(sample);
-
-    if (!buf || !caps) {
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
-    }
-
-    // Retrieve frame dimensions from caps
+    // Determine frame geometry from the pad's negotiated caps
+    GstCaps* caps = gst_pad_get_current_caps(pad);
+    if (!caps) return GST_PAD_PROBE_OK;
     GstVideoInfo vinfo;
-    if (!gst_video_info_from_caps(&vinfo, caps)) {
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
-    }
+    const bool caps_ok = gst_video_info_from_caps(&vinfo, caps);
+    gst_caps_unref(caps);
+    if (!caps_ok) return GST_PAD_PROBE_OK;
 
-    GstMapInfo map;
-    if (!gst_buffer_map(buf, &map, GST_MAP_READ)) {
-        gst_sample_unref(sample);
-        return GST_FLOW_ERROR;
-    }
-
-    const int W = vinfo.width;
-    const int H = vinfo.height;
-    const int stride = vinfo.stride[0]; // bytes per row (BGRx = 4 bytes/pixel)
-
-    // Wrap pixel data in a cv::Mat (zero-copy — we hold the GstMapInfo)
-    // BGRx has 4 channels; OpenCV detectors just read the first 3 (B, G, R).
-    cv::Mat frame(H, W, CV_8UC4,
-                  reinterpret_cast<void*>(map.data),
-                  static_cast<size_t>(stride));
-
-    // ---- Run all trackers and aggregate bboxes ----
-    DsMsgBbox msg{};
-    msg.type             = DS_MSG_BBOX;
-    msg.protocol_version = DS_PROTOCOL_VERSION;
-    msg.frame_seq        = self->m_frame_seq.fetch_add(1, std::memory_order_relaxed);
-    msg.capture_ts_us    = capture_ts;  // set at callback entry — before tracker cost
-    msg.send_ts_us       = 0;           // filled just before ZMQ send
-    msg.src_width        = static_cast<uint32_t>(W);
-    msg.src_height       = static_cast<uint32_t>(H);
-    msg.bbox_count       = 0;
-
-    // Store PTS → {capture_ts, frame_seq} so sei_inject_probe_cb can embed them
-    // into the corresponding encoded H.264 frame on the encoder branch.
+    // Populate SEI map keyed by PTS so sei_inject_probe_cb can embed timestamps
     if (GST_BUFFER_PTS_IS_VALID(buf)) {
         std::lock_guard<std::mutex> lk(self->m_sei_map_mtx);
-        auto& slot = self->m_sei_map[self->m_sei_map_head % 16];
+        auto& slot = self->m_sei_map[self->m_sei_map_head % kSeiMapSize];
         slot.pts           = GST_BUFFER_PTS(buf);
         slot.capture_ts_us = capture_ts;
-        slot.frame_seq     = msg.frame_seq;
+        slot.frame_seq     = seq;
         ++self->m_sei_map_head;
     }
 
-    const uint32_t stats_en = self->m_cfg.debug.stats_interval_s;
+    // Seed tee_ts_map for enc_sink_probe_cb to measure venc_q wait latency
+    if (self->m_cfg.debug.stats_interval_s > 0 && GST_BUFFER_PTS_IS_VALID(buf)) {
+        std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
+        auto& e = self->m_tee_ts_map[self->m_tee_ts_map_head % kTeeTsMapSize];
+        e.pts      = GST_BUFFER_PTS(buf);
+        e.t_tee_us = now_mono;
+        ++self->m_tee_ts_map_head;
+    }
 
-    // Appsink branch latency: tee → appsink callback entry.
-    // Read tee-exit timestamp for this PTS (written by tee_sink_probe_cb).
-    // Do NOT clear the entry here — enc_sink_probe_cb clears it on the encode side.
-    if (stats_en && GST_BUFFER_PTS_IS_VALID(buf)) {
-        const GstClockTime pts = GST_BUFFER_PTS(buf);
-        uint64_t t_tee = 0;
+    // Pre-encode-chain latency: vconv sink → venc_q sink
+    {
+        std::lock_guard<std::mutex> lk(self->m_timing_mtx);
+        if (self->m_pretee_in_ts != 0) {
+            const uint64_t lat = now_mono - self->m_pretee_in_ts;
+            if (lat < 2000000ULL) self->m_pretee_stats.record(lat);
+            self->m_pretee_in_ts = 0;
+        }
+    }
+
+    // memcpy BGRx → inference slot; publish seq atomically so inference thread
+    // starts immediately in parallel with the encoder.
+    GstMapInfo map;
+    if (gst_buffer_map(buf, &map, GST_MAP_READ)) {
         {
-            std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
-            for (auto& e : self->m_tee_ts_map) {
-                if (e.pts == pts && e.t_tee_us != 0) {
-                    t_tee = e.t_tee_us;
-                    break;
+            std::lock_guard<std::mutex> lk(self->m_slot_mtx);
+            auto& fs        = self->m_frame_slot;
+            fs.data.resize(map.size);
+            std::memcpy(fs.data.data(), map.data, map.size);
+            fs.width        = static_cast<uint32_t>(vinfo.width);
+            fs.height       = static_cast<uint32_t>(vinfo.height);
+            fs.stride       = static_cast<uint32_t>(vinfo.stride[0]);
+            fs.seq          = seq;
+            fs.capture_ts_us = capture_ts;
+        }
+        gst_buffer_unmap(buf, &map);
+        self->m_slot_seq.store(seq, std::memory_order_release);
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
+// ---------------------------------------------------------------------------
+// executor_thread_func — tracker/bbox thread (parallel with GStreamer encoder)
+//
+// Takes the latest available FrameSlot (latest-wins: if inference is slower
+// than source fps it always works on the newest frame), runs enabled trackers,
+// and fires the bbox callback (ZMQ send).  dummy_bbox mode fires immediately
+// with bbox_count=0 — no tracker execution.
+// ---------------------------------------------------------------------------
+void CapturePipeline::inference_thread_func() {
+    DS_INFO("CapturePipeline: executor thread started\n");
+
+    uint64_t last_seen_seq = UINT64_MAX; // sentinel: nothing processed yet
+
+    while (!m_executor_stop.load(std::memory_order_acquire)) {
+        // Poll for a new seq at 100 µs intervals — no condvar, no queue.
+        const uint64_t published = m_slot_seq.load(std::memory_order_acquire);
+        if (published == last_seen_seq || published == UINT64_MAX) {
+            usleep(100);
+            continue;
+        }
+
+        // A new frame is available — copy it out under the slot lock.
+        // We always take the newest frame in the slot (latest-wins), but we
+        // tag the ZMQ message with slot.seq (not 'published') so the seq
+        // matches the actual pixels used.  last_seen_seq tracks slot.seq so
+        // we never re-process the same slot twice.
+        FrameSlot slot;
+        {
+            std::lock_guard<std::mutex> lk(m_slot_mtx);
+            slot = m_frame_slot;
+        }
+        if (slot.seq == last_seen_seq) {
+            // Slot didn't advance past what we last processed — nothing new.
+            usleep(100);
+            continue;
+        }
+        last_seen_seq = slot.seq;
+
+        DsMsgBbox msg{};
+        msg.type             = DS_MSG_BBOX;
+        msg.protocol_version = DS_PROTOCOL_VERSION;
+        msg.frame_seq        = slot.seq;
+        msg.capture_ts_us    = slot.capture_ts_us;
+        msg.src_width        = slot.width;
+        msg.src_height       = slot.height;
+        msg.bbox_count       = 0;
+
+        const uint32_t stats_en = m_cfg.debug.stats_interval_s;
+        const uint64_t exec_t0  = ds_mono_us(); // always measured for the TRACE
+
+        if (!m_cfg.detectors.dummy_bbox && !m_trackers.empty()) {
+            cv::Mat frame(static_cast<int>(slot.height),
+                          static_cast<int>(slot.width),
+                          CV_8UC4,
+                          slot.data.data(),
+                          static_cast<size_t>(slot.stride));
+
+            for (size_t ti = 0; ti < m_trackers.size() && ti < kMaxTrackers; ++ti) {
+                const uint64_t t0 = stats_en ? ds_mono_us() : 0;
+
+                std::vector<DsBbox> boxes = m_trackers[ti]->process(frame, slot.seq);
+
+                if (stats_en) {
+                    std::lock_guard<std::mutex> lk(m_timing_mtx);
+                    m_tracker_stats[ti].record(ds_mono_us() - t0);
+                }
+                for (const auto& b : boxes) {
+                    if (msg.bbox_count >= DS_MAX_BBOXES) break;
+                    msg.bboxes[msg.bbox_count++] = b;
                 }
             }
         }
-        if (t_tee != 0) {
-            const uint64_t lat = appsink_mono_ts - t_tee;
-            if (lat < 2000000ULL) {
-                std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-                self->m_appsink_branch_stats.record(lat);
-            }
-        }
-    }
 
-    for (size_t ti = 0; ti < self->m_trackers.size() && ti < kMaxTrackers; ++ti) {
-        const uint64_t t0 = stats_en ? ds_mono_us() : 0;
+        const uint64_t exec_dur = ds_mono_us() - exec_t0;
 
-        std::vector<DsBbox> boxes = self->m_trackers[ti]->process(frame);
-
+        // Record total executor duration (all trackers combined, or 0 for dummy).
         if (stats_en) {
-            const uint64_t lat = ds_mono_us() - t0;
-            std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-            self->m_tracker_stats[ti].record(lat);
+            std::lock_guard<std::mutex> lk(m_timing_mtx);
+            m_executor_stats.record(exec_dur);
         }
 
-        // Append boxes to message (respect DS_MAX_BBOXES limit)
-        for (const auto& b : boxes) {
-            if (msg.bbox_count >= DS_MAX_BBOXES) break;
-            msg.bboxes[msg.bbox_count++] = b;
+        if (m_bbox_cb) {
+            msg.send_ts_us = ds_realtime_us();
+            m_bbox_cb(msg);
         }
+
+        // One TRACE per frame: detector names, inference duration, bbox count.
+        char det_names[64] = "dummy";
+        if (!m_cfg.detectors.dummy_bbox) {
+            det_names[0] = '\0';
+            for (size_t ti = 0; ti < m_trackers.size() && ti < kMaxTrackers; ++ti) {
+                if (det_names[0]) std::strncat(det_names, "+", sizeof(det_names) - 1 - std::strlen(det_names));
+                std::strncat(det_names, m_trackers[ti]->name(), sizeof(det_names) - 1 - std::strlen(det_names));
+            }
+            if (det_names[0] == '\0') std::strncpy(det_names, "none", sizeof(det_names) - 1);
+        }
+        DS_TRACE("CapturePipeline: executor  seq=%-6" PRIu64
+                 "  det=%-8s  dur=%5" PRIu64 " us  bboxes=%u\n",
+                 msg.frame_seq, det_names, exec_dur, msg.bbox_count);
     }
 
-    gst_buffer_unmap(buf, &map);
-    gst_sample_unref(sample);
-
-    // Fire callback (ZMQ send happens there)
-    if (self->m_bbox_cb) {
-        msg.send_ts_us = ds_realtime_us();
-        self->m_bbox_cb(msg);
-    }
-
-    DS_TRACE("CapturePipeline: appsink seq=%" PRIu64
-             " bboxes=%u capture_ts=%" PRIu64 " us\n",
-             msg.frame_seq, msg.bbox_count, msg.capture_ts_us);
-
-    return GST_FLOW_OK;
+    DS_INFO("CapturePipeline: executor thread exited\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -362,8 +394,8 @@ gboolean CapturePipeline::bus_callback(GstBus* /*bus*/, GstMessage* msg, gpointe
 // Pad probe callbacks — pipeline latency measurement
 // ---------------------------------------------------------------------------
 
-// "vconv" (first videoconvert) sink pad — record the moment a decoded/captured
-// frame enters the pre-tee processing chain.
+// "vconv" (first videoconvert) sink pad — records the moment a decoded/captured
+// frame enters the pre-encode processing chain (decode+colorconv+scale+rate).
 GstPadProbeReturn CapturePipeline::vconv_sink_probe_cb(GstPad*, GstPadProbeInfo*,
                                                         gpointer udata) {
     auto* self = static_cast<CapturePipeline*>(udata);
@@ -373,63 +405,87 @@ GstPadProbeReturn CapturePipeline::vconv_sink_probe_cb(GstPad*, GstPadProbeInfo*
     return GST_PAD_PROBE_OK;
 }
 
-// "t" (tee) sink pad — compute pre-tee latency; seed the tee-ts map so that
-// both downstream branches can measure their own path latency from the same origin.
-GstPadProbeReturn CapturePipeline::tee_sink_probe_cb(GstPad*, GstPadProbeInfo* info,
-                                                      gpointer udata) {
+// vconv src pad — fires once per BGRx frame exiting videoconvert, before videoscale/
+// videorate.  When stats are enabled measures the videoconvert element's own processing
+// latency (vconv_sink_ts → vconv_src_ts) and records it in m_vconv_stats.
+// m_pretee_in_ts is left non-zero so that vraw_probe_cb can still measure the full
+// pre-encode chain latency (vconv_sink → venc_q_sink).
+GstPadProbeReturn CapturePipeline::vconv_src_probe_cb(GstPad*, GstPadProbeInfo*,
+                                                       gpointer udata) {
     auto* self = static_cast<CapturePipeline*>(udata);
-    const uint64_t now = ds_mono_us();
+    const uint64_t ts = ds_mono_us();
 
-    // Pre-tee latency: vconv sink → tee sink (decode, colorconv, scale, rate)
     {
         std::lock_guard<std::mutex> lk(self->m_timing_mtx);
         if (self->m_pretee_in_ts != 0) {
-            const uint64_t lat = now - self->m_pretee_in_ts;
-            if (lat < 2000000ULL) self->m_pretee_stats.record(lat);
-            self->m_pretee_in_ts = 0;
+            const uint64_t lat = ts - self->m_pretee_in_ts;
+            if (lat < 2000000ULL) self->m_vconv_stats.record(lat);
         }
     }
 
-    // Seed tee-exit timestamp keyed by PTS for per-branch latency.
+    return GST_PAD_PROBE_OK;
+}
+
+// filesrc src pad — fires for every compressed bitstream chunk pushed from filesrc
+// into decodebin (file mode only).  One chunk ≠ one frame (decodebin buffers internally),
+// so this probe provides chunk-level throughput visibility rather than per-frame timing.
+GstPadProbeReturn CapturePipeline::filesrc_src_probe_cb(GstPad*, GstPadProbeInfo* info,
+                                                         gpointer /*udata*/) {
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (buf && GST_BUFFER_PTS_IS_VALID(buf)) {
-        std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
-        auto& slot = self->m_tee_ts_map[self->m_tee_ts_map_head % kTeeTsMapSize];
-        slot.pts      = GST_BUFFER_PTS(buf);
-        slot.t_tee_us = now;
-        ++self->m_tee_ts_map_head;
-    }
+    if (!buf) return GST_PAD_PROBE_OK;
+
+    DS_TRACE("filesrc → decodebin  offset=%" G_GUINT64_FORMAT " bytes=%" G_GSIZE_FORMAT "\n",
+             GST_BUFFER_OFFSET_IS_VALID(buf) ? GST_BUFFER_OFFSET(buf) : 0ULL,
+             gst_buffer_get_size(buf));
     return GST_PAD_PROBE_OK;
 }
 
 // venc sink pad — push encoder entry timestamp into FIFO; also compute encode-branch
-// queue latency (tee → encoder entry) and clear the tee-ts map entry.
+// queue latency (venc_q → encoder entry) and clear the tee-ts map entry.
 GstPadProbeReturn CapturePipeline::enc_sink_probe_cb(GstPad*, GstPadProbeInfo* info,
                                                      gpointer udata) {
     auto* self = static_cast<CapturePipeline*>(udata);
     const uint64_t ts = ds_mono_us();
 
     uint64_t enc_branch_lat = 0;
+    uint64_t frame_seq      = 0;
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (buf && GST_BUFFER_PTS_IS_VALID(buf)) {
-        const GstClockTime pts = GST_BUFFER_PTS(buf);
-        std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
-        for (auto& e : self->m_tee_ts_map) {
-            if (e.pts == pts && e.t_tee_us != 0) {
-                const uint64_t lat = ts - e.t_tee_us;
-                if (lat < 2000000ULL) enc_branch_lat = lat;
-                e.t_tee_us = 0;
-                break;
+    const GstClockTime pts = (buf && GST_BUFFER_PTS_IS_VALID(buf))
+                             ? GST_BUFFER_PTS(buf) : GST_CLOCK_TIME_NONE;
+
+    if (pts != GST_CLOCK_TIME_NONE) {
+        // venc_q preserves PTS unchanged — lookup SEI map (read-only, don't consume)
+        // to get frame_seq for the trace.
+        {
+            std::lock_guard<std::mutex> lk(self->m_sei_map_mtx);
+            for (const auto& e : self->m_sei_map) {
+                if (e.pts == pts && e.capture_ts_us != 0) {
+                    frame_seq = e.frame_seq;
+                    break;
+                }
+            }
+        }
+        // venc_q queue-wait latency
+        {
+            std::lock_guard<std::mutex> lk(self->m_tee_ts_mtx);
+            for (auto& e : self->m_tee_ts_map) {
+                if (e.pts == pts && e.t_tee_us != 0) {
+                    const uint64_t lat = ts - e.t_tee_us;
+                    if (lat < 2000000ULL) enc_branch_lat = lat;
+                    e.t_tee_us = 0;
+                    break;
+                }
             }
         }
     }
 
     std::lock_guard<std::mutex> lk(self->m_timing_mtx);
     if (enc_branch_lat) self->m_enc_branch_stats.record(enc_branch_lat);
-    // Push entry timestamp into FIFO for enc_src_probe_cb to consume
-    auto& slot = self->m_enc_fifo[self->m_enc_fifo_head % kEncFifoSize];
-    slot.ts   = ts;
-    slot.used = true;
+    // Push entry timestamp + seq into FIFO for enc_src_probe_cb to consume
+    auto& slot    = self->m_enc_fifo[self->m_enc_fifo_head % kEncFifoSize];
+    slot.ts        = ts;
+    slot.frame_seq = frame_seq;
+    slot.used      = true;
     ++self->m_enc_fifo_head;
     return GST_PAD_PROBE_OK;
 }
@@ -444,20 +500,31 @@ GstPadProbeReturn CapturePipeline::enc_src_probe_cb(GstPad*, GstPadProbeInfo* in
 
     auto* self = static_cast<CapturePipeline*>(udata);
     const uint64_t now = ds_mono_us();
-    std::lock_guard<std::mutex> lk(self->m_timing_mtx);
-    for (auto& e : self->m_enc_fifo) {
-        if (e.used) {
-            const uint64_t lat = now - e.ts;
-            if (lat < 2000000ULL) self->m_enc_stats.record(lat);
-            e.used = false;
-            break;
+
+    uint64_t frame_seq = 0;
+    uint64_t enc_dur   = 0;
+    {
+        std::lock_guard<std::mutex> lk(self->m_timing_mtx);
+        for (auto& e : self->m_enc_fifo) {
+            if (e.used) {
+                enc_dur   = now - e.ts;
+                if (enc_dur < 2000000ULL) self->m_enc_stats.record(enc_dur);
+                else enc_dur = 0;
+                frame_seq = e.frame_seq;
+                e.used    = false;
+                break;
+            }
         }
     }
+
+    DS_TRACE("CapturePipeline: encode    seq=%-6" PRIu64 "  dur=%5" PRIu64 " us\n",
+             frame_seq, enc_dur);
     return GST_PAD_PROBE_OK;
 }
 
-// h264parse src pad — prepend a VisionBridge SEI NAL carrying {capture_ts_us, frame_seq}.// The SEI rides through RTP/UDP unchanged and is extracted by sei_extract_probe_cb on
-// the render side, enabling in-band E2E latency measurement without a shared clock.
+// h264parse src pad — prepend a VisionBridge SEI NAL
+// carrying {capture_ts_us, frame_seq}.  The SEI rides through RTP/UDP unchanged
+// and is extracted by sei_extract_probe_cb on the render side.
 GstPadProbeReturn CapturePipeline::sei_inject_probe_cb(GstPad*, GstPadProbeInfo* info,
                                                        gpointer udata) {
     GstBuffer* orig = GST_PAD_PROBE_INFO_BUFFER(info);
@@ -469,21 +536,48 @@ GstPadProbeReturn CapturePipeline::sei_inject_probe_cb(GstPad*, GstPadProbeInfo*
     auto* self = static_cast<CapturePipeline*>(udata);
     const GstClockTime pts = GST_BUFFER_PTS(orig);
 
-    // Look up the capture timestamp recorded in the appsink callback for this PTS
+    // Look up the capture timestamp for this PTS.
+    // Primary: exact PTS match — works when venc_q-sink PTS == h264parse-src PTS.
+    // Fallback: if the encoder transforms PTSes internally (x264enc converts
+    //   stream_time ↔ running_time, so a file with a large PTS base causes a
+    //   systematic mismatch), pop the oldest unconsumed entry by frame_seq.
+    //   This is safe for bframes=0 because frames are serialised in encode order;
+    //   the occasional wrong assignment during a leaky-queue drop is acceptable.
     uint64_t capture_ts = 0, frame_seq = 0;
     {
         std::lock_guard<std::mutex> lk(self->m_sei_map_mtx);
+
+        // 1. Exact PTS match (ideal path)
         for (auto& e : self->m_sei_map) {
             if (e.pts == pts && e.capture_ts_us != 0) {
-                capture_ts      = e.capture_ts_us;
-                frame_seq       = e.frame_seq;
+                capture_ts = e.capture_ts_us;
+                frame_seq  = e.frame_seq;
                 e.capture_ts_us = 0; // consumed
                 break;
             }
         }
+
+        // 2. FIFO fallback: PTS domain mismatch (e.g. x264enc running-time
+        //    vs stream-time transformation).  Find the oldest unconsumed entry.
+        if (capture_ts == 0) {
+            SeiMapEntry* oldest = nullptr;
+            for (auto& e : self->m_sei_map) {
+                if (e.capture_ts_us != 0) {
+                    if (!oldest || e.frame_seq < oldest->frame_seq)
+                        oldest = &e;
+                }
+            }
+            if (oldest) {
+                capture_ts = oldest->capture_ts_us;
+                frame_seq  = oldest->frame_seq;
+                oldest->capture_ts_us = 0;
+                DS_DBG("CapturePipeline: SEI inject FIFO fallback (PTS %" PRIu64
+                       " not in map) → seq=%" PRIu64 "\n", pts, frame_seq);
+            }
+        }
     }
     if (capture_ts == 0)
-        return GST_PAD_PROBE_OK; // no mapping for this PTS
+        return GST_PAD_PROBE_OK; // no data at all (still in startup)
 
     const auto sei_bytes = sei_build_nal(capture_ts, frame_seq);
 
@@ -510,8 +604,25 @@ GstPadProbeReturn CapturePipeline::sei_inject_probe_cb(GstPad*, GstPadProbeInfo*
     gst_buffer_unref(orig);
     GST_PAD_PROBE_INFO_DATA(info) = new_buf;
 
-    DS_TRACE("CapturePipeline: SEI inject seq=%" PRIu64
-             " capture_ts=%" PRIu64 " us\n", frame_seq, capture_ts);
+    return GST_PAD_PROBE_OK;
+}
+
+// ---------------------------------------------------------------------------
+// vpay src pad — fires once per RTP packet that leaves the payloader (→ udpsink).
+// Emits a TRACE line per packet with seq# looked up via the SEI map.
+// NOTE: a single encoded frame typically maps to one RTP packet for sub-MTU
+// frames; larger frames are fragmented into multiple RTP packets by rtph264pay,
+// so this probe fires once per *RTP packet*, not once per frame.
+// ---------------------------------------------------------------------------
+GstPadProbeReturn CapturePipeline::vpay_src_probe_cb(GstPad*, GstPadProbeInfo* info,
+                                                      gpointer /*udata*/) {
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf) return GST_PAD_PROBE_OK;
+
+    // Skip SPS/PPS codec-data packets — they carry no frame payload.
+    if (GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_HEADER))
+        return GST_PAD_PROBE_OK;
+
     return GST_PAD_PROBE_OK;
 }
 
@@ -519,17 +630,18 @@ GstPadProbeReturn CapturePipeline::sei_inject_probe_cb(GstPad*, GstPadProbeInfo*
 // emit_periodic_stats — called by 1-second GLib timer
 // ---------------------------------------------------------------------------
 void CapturePipeline::emit_periodic_stats() {
-    LatencyStats pretee_snap, appsink_br_snap, enc_br_snap, enc_snap;
+    LatencyStats pretee_snap, enc_br_snap, enc_snap, executor_snap, vconv_snap;
     LatencyStats trk_snap[kMaxTrackers];
-    bool have_pretee = false, have_appsink_br = false,
-         have_enc_br = false, have_enc = false;
+    bool have_pretee = false, have_enc_br = false, have_enc = false, have_executor = false;
+    bool have_vconv  = false;
     bool have_trk[kMaxTrackers]{};
     {
         std::lock_guard<std::mutex> lk(m_timing_mtx);
-        if (!m_pretee_stats.empty())         { pretee_snap     = m_pretee_stats.reset_and_return();          have_pretee     = true; }
-        if (!m_appsink_branch_stats.empty()) { appsink_br_snap = m_appsink_branch_stats.reset_and_return();  have_appsink_br = true; }
-        if (!m_enc_branch_stats.empty())     { enc_br_snap     = m_enc_branch_stats.reset_and_return();      have_enc_br     = true; }
-        if (!m_enc_stats.empty())            { enc_snap        = m_enc_stats.reset_and_return();             have_enc        = true; }
+        if (!m_pretee_stats.empty())     { pretee_snap    = m_pretee_stats.reset_and_return();     have_pretee    = true; }
+        if (!m_vconv_stats.empty())      { vconv_snap     = m_vconv_stats.reset_and_return();      have_vconv     = true; }
+        if (!m_enc_branch_stats.empty()) { enc_br_snap    = m_enc_branch_stats.reset_and_return(); have_enc_br    = true; }
+        if (!m_enc_stats.empty())        { enc_snap       = m_enc_stats.reset_and_return();        have_enc       = true; }
+        if (!m_executor_stats.empty())   { executor_snap  = m_executor_stats.reset_and_return();   have_executor  = true; }
         for (int i = 0; i < kMaxTrackers; ++i) {
             if (!m_tracker_stats[i].empty()) {
                 trk_snap[i] = m_tracker_stats[i].reset_and_return();
@@ -550,10 +662,11 @@ void CapturePipeline::emit_periodic_stats() {
         msg += line;
     };
 
-    if (have_pretee)     append("pretee",         pretee_snap);
-    if (have_appsink_br) append("appsink_branch", appsink_br_snap);
-    if (have_enc_br)     append("enc_branch",     enc_br_snap);
-    if (have_enc)        append("encode",         enc_snap);
+    if (have_pretee)    append("pretee",      pretee_snap);
+    if (have_vconv)     append("vconv",       vconv_snap);
+    if (have_enc_br)    append("enc_queue",   enc_br_snap);
+    if (have_enc)       append("encode",      enc_snap);
+    if (have_executor)  append("executor",    executor_snap);
 
     for (size_t i = 0; i < m_trackers.size() && i < kMaxTrackers; ++i) {
         if (have_trk[i]) {
@@ -614,16 +727,22 @@ bool CapturePipeline::start() {
         return false;
     }
 
-    // Grab appsink and connect callback
-    m_appsink = gst_bin_get_by_name(GST_BIN(m_pipeline), "vsink");
-    if (!m_appsink) {
-        DS_ERR("CapturePipeline: appsink 'vsink' not found\n");
+    // Get venc_q element — its sink pad is probed by vraw_probe_cb for frame
+    // copy + executor notify (works for both normal and dummy_bbox modes).
+    m_venc_q = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc_q");
+    if (!m_venc_q) {
+        DS_ERR("CapturePipeline: queue 'venc_q' not found\n");
         gst_object_unref(m_pipeline); m_pipeline = nullptr;
         return false;
     }
-    GstAppSinkCallbacks cbs{};
-    cbs.new_sample = on_new_sample;
-    gst_app_sink_set_callbacks(GST_APP_SINK(m_appsink), &cbs, this, nullptr);
+    {
+        GstPad* snk = gst_element_get_static_pad(m_venc_q, "sink");
+        if (snk) {
+            m_vraw_probe_id = gst_pad_add_probe(snk,
+                GST_PAD_PROBE_TYPE_BUFFER, vraw_probe_cb, this, nullptr);
+            gst_object_unref(snk);
+        }
+    }
 
     // Attach SEI inject probe unconditionally — in-band E2E timestamp embed
     m_h264parse = gst_bin_get_by_name(GST_BIN(m_pipeline), "vsparse");
@@ -638,11 +757,29 @@ bool CapturePipeline::start() {
         DS_WARN("CapturePipeline: h264parse 'vsparse' not found — SEI injection disabled\n");
     }
 
-    // Attach timing probes only when stats are enabled
+    // Always attach encoder probes — enc_src triggers inference at encoder-output time
+    // ensuring video seq and bbox seq are aligned.
+    m_encoder = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
+    if (m_encoder) {
+        GstPad* snk = gst_element_get_static_pad(m_encoder, "sink");
+        if (snk) {
+            m_enc_sink_probe_id = gst_pad_add_probe(snk,
+                GST_PAD_PROBE_TYPE_BUFFER, enc_sink_probe_cb, this, nullptr);
+            gst_object_unref(snk);
+        }
+        GstPad* src = gst_element_get_static_pad(m_encoder, "src");
+        if (src) {
+            m_enc_src_probe_id = gst_pad_add_probe(src,
+                GST_PAD_PROBE_TYPE_BUFFER, enc_src_probe_cb, this, nullptr);
+            gst_object_unref(src);
+        }
+    } else {
+        DS_WARN("CapturePipeline: encoder 'venc' not found — inference will not run\n");
+    }
+
+    // Attach vconv timing probes only when stats are enabled
     if (m_cfg.debug.stats_interval_s > 0) {
         m_vconv_first = gst_bin_get_by_name(GST_BIN(m_pipeline), "vconv");
-        m_tee         = gst_bin_get_by_name(GST_BIN(m_pipeline), "t");
-        m_encoder     = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
 
         if (m_vconv_first) {
             GstPad* snk = gst_element_get_static_pad(m_vconv_first, "sink");
@@ -651,35 +788,30 @@ bool CapturePipeline::start() {
                     GST_PAD_PROBE_TYPE_BUFFER, vconv_sink_probe_cb, this, nullptr);
                 gst_object_unref(snk);
             }
-        } else {
-            DS_WARN("CapturePipeline: 'vconv' element not found — pre-tee timing disabled\n");
-        }
-
-        if (m_tee) {
-            GstPad* snk = gst_element_get_static_pad(m_tee, "sink");
-            if (snk) {
-                m_tee_sink_probe_id = gst_pad_add_probe(snk,
-                    GST_PAD_PROBE_TYPE_BUFFER, tee_sink_probe_cb, this, nullptr);
-                gst_object_unref(snk);
-            }
-        } else {
-            DS_WARN("CapturePipeline: tee element 't' not found — branch timing disabled\n");
-        }
-
-        if (m_encoder) {
-            GstPad* snk = gst_element_get_static_pad(m_encoder, "sink");
-            if (snk) {
-                m_enc_sink_probe_id = gst_pad_add_probe(snk,
-                    GST_PAD_PROBE_TYPE_BUFFER, enc_sink_probe_cb, this, nullptr);
-                gst_object_unref(snk);
-            }
-            GstPad* src = gst_element_get_static_pad(m_encoder, "src");
+            GstPad* src = gst_element_get_static_pad(m_vconv_first, "src");
             if (src) {
-                m_enc_src_probe_id = gst_pad_add_probe(src,
-                    GST_PAD_PROBE_TYPE_BUFFER, enc_src_probe_cb, this, nullptr);
+                m_vconv_src_probe_id = gst_pad_add_probe(src,
+                    GST_PAD_PROBE_TYPE_BUFFER, vconv_src_probe_cb, this, nullptr);
                 gst_object_unref(src);
             }
+        } else {
+            DS_WARN("CapturePipeline: 'vconv' not found — pre-encode chain timing disabled\n");
         }
+
+        // filesrc output probe disabled — uncomment to re-enable chunk-level TRACE
+        // if (m_cfg.input.type == "file") {
+        //     m_filesrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "vfsrc");
+        //     if (m_filesrc) {
+        //         GstPad* src = gst_element_get_static_pad(m_filesrc, "src");
+        //         if (src) {
+        //             m_filesrc_src_probe_id = gst_pad_add_probe(src,
+        //                 GST_PAD_PROBE_TYPE_BUFFER, filesrc_src_probe_cb, this, nullptr);
+        //             gst_object_unref(src);
+        //         }
+        //     } else {
+        //         DS_WARN("CapturePipeline: 'vfsrc' not found — filesrc output probe disabled\n");
+        //     }
+        // }
     }
 
     // Bus watch
@@ -697,6 +829,9 @@ bool CapturePipeline::start() {
     }
 
     m_running.store(true);
+    // Start executor thread — runs trackers (or dummy bbox) in parallel with encoder
+    m_executor_stop.store(false);
+    m_executor_thread = std::thread(&CapturePipeline::inference_thread_func, this);
     m_gst_thread = std::thread(&CapturePipeline::gst_thread_func, this);
 
     DS_INFO("CapturePipeline: started (%s %ux%u@%u/%ufps → %s:%u)\n",
@@ -714,6 +849,10 @@ void CapturePipeline::stop() {
     if (!m_pipeline) return;
     m_running.store(false);
 
+    // Signal executor thread to exit and wait for it before tearing down GStreamer
+    m_executor_stop.store(true);
+    if (m_executor_thread.joinable()) m_executor_thread.join();
+
     // Remove probes before transitioning to NULL to avoid use-after-free
     auto remove_probe = [](GstElement* elem, const char* pad_name, gulong& probe_id) {
         if (elem && probe_id) {
@@ -723,10 +862,12 @@ void CapturePipeline::stop() {
         }
     };
     remove_probe(m_vconv_first, "sink", m_vconv_sink_probe_id);
-    remove_probe(m_tee,         "sink", m_tee_sink_probe_id);
+    remove_probe(m_vconv_first, "src",  m_vconv_src_probe_id);
+    remove_probe(m_venc_q,      "sink", m_vraw_probe_id);
     remove_probe(m_h264parse,   "src",  m_sei_inject_probe_id);
     remove_probe(m_encoder,     "sink", m_enc_sink_probe_id);
     remove_probe(m_encoder,     "src",  m_enc_src_probe_id);
+    // remove_probe(m_filesrc,     "src",  m_filesrc_src_probe_id); // filesrc probe disabled
 
     if (m_timing_timer_id) {
         g_source_remove(m_timing_timer_id);
@@ -739,10 +880,11 @@ void CapturePipeline::stop() {
     if (m_gst_thread.joinable()) m_gst_thread.join();
 
     if (m_vconv_first){ gst_object_unref(m_vconv_first); m_vconv_first = nullptr; }
-    if (m_tee)        { gst_object_unref(m_tee);         m_tee         = nullptr; }
+    if (m_venc_q)     { gst_object_unref(m_venc_q);      m_venc_q      = nullptr; }
     if (m_h264parse)  { gst_object_unref(m_h264parse);   m_h264parse   = nullptr; }
+    if (m_vpay)       { gst_object_unref(m_vpay);        m_vpay        = nullptr; }
     if (m_encoder)    { gst_object_unref(m_encoder);     m_encoder     = nullptr; }
-    if (m_appsink)    { gst_object_unref(m_appsink);     m_appsink     = nullptr; }
+    if (m_filesrc)    { gst_object_unref(m_filesrc);     m_filesrc     = nullptr; }
     gst_object_unref(m_pipeline); m_pipeline = nullptr;
     if (m_loop) { g_main_loop_unref(m_loop); m_loop = nullptr; }
 

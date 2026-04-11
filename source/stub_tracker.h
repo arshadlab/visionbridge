@@ -29,7 +29,7 @@ public:
     ~StubTracker() override = default;
 
     bool init(int width, int height) override;
-    std::vector<DsBbox> process(const cv::Mat& frame) override;
+    std::vector<DsBbox> process(const cv::Mat& frame, uint64_t seq) override;
     const char* name() const override { return "stub"; }
 
 private:

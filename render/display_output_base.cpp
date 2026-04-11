@@ -79,6 +79,8 @@ void BboxReceiver::recv_loop() {
             slot.msg       = std::move(shared);
             ++m_ring_head;
         }
+        // Wake any thread blocked in wait_for_seq() after releasing the lock.
+        m_bbox_cv.notify_all();
     }
     DS_DBG("BboxReceiver: recv thread exiting\n");
 }
@@ -157,6 +159,49 @@ std::shared_ptr<DsMsgBbox> BboxReceiver::best_for_frame(const DecodedFrame* fram
     }
 
     return best_msg; // nullptr → caller skips bbox overlay for this frame
+}
+
+// ---------------------------------------------------------------------------
+std::shared_ptr<DsMsgBbox> BboxReceiver::wait_for_seq(uint64_t seq,
+                                                       uint64_t timeout_us) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::microseconds(timeout_us);
+
+    std::unique_lock<std::mutex> lk(m_mtx);
+
+    while (true) {
+        // Purge entries too stale to be useful (prevents ring saturation)
+        if (seq > kMaxSkewFrames) {
+            const uint64_t earliest = seq - kMaxSkewFrames;
+            for (auto& e : m_ring) {
+                if (e.msg && e.frame_seq < earliest) {
+                    e.msg.reset();
+                    e.frame_seq = 0;
+                }
+            }
+        }
+
+        // Exact match: consume entry so it is not drawn on a future frame.
+        for (auto& e : m_ring) {
+            if (e.msg && e.frame_seq == seq) {
+                auto result = std::move(e.msg);
+                e.frame_seq = 0;
+                ++m_exact_count;
+                return result;
+            }
+        }
+
+        // Not in ring yet — wait for the next ZMQ push or timeout.
+        if (m_bbox_cv.wait_until(lk, deadline) == std::cv_status::timeout) {
+            ++m_no_bbox_count;
+            return nullptr; // caller logs the error
+        }
+
+        if (!m_running.load(std::memory_order_relaxed)) {
+            ++m_no_bbox_count;
+            return nullptr;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

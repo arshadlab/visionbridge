@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <getopt.h>
 #include <gst/gst.h>
 
@@ -49,6 +50,9 @@ static void print_usage(const char* prog) {
     printf("  -l, --log-level <lvl>     Log level: error warn info debug trace (default: info)\n");
     printf("      --loop                Loop video file when EOS is reached (file input only)\n");
     printf("      --no-loop             Stop when video file ends\n");
+    printf("      --detector <list>     Comma-separated detectors to enable (overrides JSON).\n");
+    printf("                            Values: yolo  mog2  stub  dummy\n");
+    printf("                            e.g. --detector yolo  or  --detector mog2,stub\n");
     printf("  -h, --help                Show this help\n");
     printf("\nTransport mode (default: multicast 239.1.1.1:5004 per source.json):\n");
     printf("  Multicast (default): %s --config configs/source.json\n", prog);
@@ -57,6 +61,8 @@ static void print_usage(const char* prog) {
     printf("\nOther examples:\n");
     printf("  %s --webcam /dev/video1 --log-level debug\n", prog);
     printf("  %s --file /path/to/video.mp4 --dest 192.168.1.20\n", prog);
+    printf("  %s --detector yolo\n", prog);
+    printf("  %s --detector mog2,stub\n", prog);
 }
 
 int main(int argc, char* argv[]) {
@@ -65,6 +71,7 @@ int main(int argc, char* argv[]) {
     std::string file_override;
     std::string dest_host;      // --dest   unicast target
     std::string mcast_group;    // --multicast group override
+    std::string detector_override; // --detector comma-separated list
     bool dest_set   = false;
     bool mcast_set  = false;
     int  loop_override = -1;    // -1 = not set, 0 = no-loop, 1 = loop
@@ -79,12 +86,13 @@ int main(int argc, char* argv[]) {
         {"loop",      no_argument,       nullptr, 'L'},
         {"no-loop",   no_argument,       nullptr, 'N'},
         {"log-level", required_argument, nullptr, 'l'},
+        {"detector",  required_argument, nullptr, 'D'},
         {"help",      no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "c:w::f:d:m::l:hLN", long_opts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:w::f:d:m::l:D:hLN", long_opts, nullptr)) != -1) {
         switch (opt) {
         case 'c': config_path     = optarg; break;
         // optional_argument requires no space between flag and value (e.g. -w/dev/video1).
@@ -111,6 +119,7 @@ int main(int argc, char* argv[]) {
             else if (strcmp(optarg, "debug") == 0) log_level = 3;
             else if (strcmp(optarg, "trace") == 0) log_level = 4;
             break;
+        case 'D': detector_override = optarg; break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
@@ -158,11 +167,50 @@ int main(int argc, char* argv[]) {
     // Apply final log level: CLI takes priority over config JSON value.
     if (log_level < 0) ds_set_log_level(static_cast<LogLevel>(cfg.debug.log_level));
 
+    // Apply --detector override: parse comma-separated list of names and replace
+    // the JSON enable_* / dummy_bbox settings so exactly the requested detectors run.
+    if (!detector_override.empty()) {
+        cfg.detectors.enable_stub = false;
+        cfg.detectors.enable_mog2 = false;
+        cfg.detectors.enable_yolo = false;
+        cfg.detectors.dummy_bbox  = false;
+
+        std::istringstream ss(detector_override);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            // trim whitespace
+            const auto first = tok.find_first_not_of(" \t");
+            const auto last  = tok.find_last_not_of(" \t");
+            if (first == std::string::npos) continue;
+            tok = tok.substr(first, last - first + 1);
+
+            if      (tok == "yolo")  cfg.detectors.enable_yolo = true;
+            else if (tok == "mog2")  cfg.detectors.enable_mog2 = true;
+            else if (tok == "stub")  cfg.detectors.enable_stub = true;
+            else if (tok == "dummy") cfg.detectors.dummy_bbox  = true;
+            else DS_WARN("--detector: unknown name '%s' (valid: yolo mog2 stub dummy)\n", tok.c_str());
+        }
+        DS_INFO("Detector override: yolo=%s mog2=%s stub=%s dummy=%s\n",
+                cfg.detectors.enable_yolo ? "on" : "off",
+                cfg.detectors.enable_mog2 ? "on" : "off",
+                cfg.detectors.enable_stub ? "on" : "off",
+                cfg.detectors.dummy_bbox  ? "on" : "off");
+    }
+
     DS_INFO("visionbridge-source starting\n");
     DS_INFO("  input:     %s (%s)\n",
             cfg.input.type.c_str(),
             cfg.input.type == "file" ? cfg.input.file.c_str() : cfg.input.device.c_str());
     DS_INFO("  appsink:   sync=%s\n", cfg.appsink_sync ? "true (real-time throttle)" : "false");
+    DS_INFO("  detectors: %s\n",
+            cfg.detectors.dummy_bbox ? "dummy (no tracking, empty bbox)"
+            : [&]() -> std::string {
+                std::string s;
+                if (cfg.detectors.enable_yolo) s += "yolo ";
+                if (cfg.detectors.enable_mog2) s += "mog2 ";
+                if (cfg.detectors.enable_stub) s += "stub ";
+                return s.empty() ? "(none — bbox channel silent)" : s;
+            }().c_str());
     DS_INFO("  transport: %s %s:%u\n",
             cfg.transport.multicast ? "[MULTICAST]" : "[UNICAST]",
             cfg.transport.host.c_str(), cfg.transport.rtp_port);

@@ -38,6 +38,9 @@ struct YoloConfig {
     /// Inference backend: "cpu" | "opencl" | "opencl_fp16" | "cuda" | "cuda_fp16"
     /// Falls back to CPU automatically if the requested backend is unavailable.
     std::string backend = "cpu";
+    /// Number of CPU threads for inference (cpu backend only).
+    /// 0 = let OpenCV choose (typically all cores).
+    int num_threads = 0;
     /// If non-empty, only detections whose class name appears in this list are
     /// reported.  Names are matched case-insensitively against coco.names.
     /// Empty list = report all classes.
@@ -48,6 +51,7 @@ struct DetectorConfig {
     bool enable_stub = true;
     bool enable_mog2 = true;
     bool enable_yolo = true;  ///< Silently disabled if OpenCV DNN not available
+    bool dummy_bbox  = false; ///< Skip all trackers; send empty bbox with correct seq# only
 
     // MOG2 parameters
     int   mog2_history       = 500;

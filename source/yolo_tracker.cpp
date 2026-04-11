@@ -5,6 +5,7 @@
 
 #include "yolo_tracker.h"
 #include "../common/logger.h"
+#include "../common/time_utils.h"
 
 #ifdef DS_HAVE_OPENCV_DNN
 
@@ -12,6 +13,7 @@
 #include <opencv2/core/ocl.hpp>
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <fstream>
 
 // Lowercase helper for case-insensitive class name matching
@@ -106,7 +108,6 @@ bool YoloTracker::init(int width, int height) {
         m_output_layers.push_back(layer_names[static_cast<size_t>(idx) - 1]);
     }
 
-    m_loaded = true;
     DS_INFO("YoloTracker: loaded '%s' output_layers=%zu\n",
             model_path.c_str(), m_output_layers.size());
 
@@ -146,43 +147,78 @@ bool YoloTracker::init(int width, int height) {
             DS_WARN("YoloTracker: none of the filter_classes matched any known class name\n");
     }
 
+    // ----- CPU thread count -----
+    // Only effective for the CPU backend; ignored silently for opencl/cuda.
+    if (m_cfg.yolo.num_threads > 0) {
+        cv::setNumThreads(m_cfg.yolo.num_threads);
+        DS_INFO("YoloTracker: CPU threads set to %d\n", m_cfg.yolo.num_threads);
+    }
+
+    // ----- Warmup pass -----
+    // Run one silent forward pass with a blank frame so OpenCL kernels are
+    // compiled and cached before the first real frame arrives.  Without this
+    // the very first inference call pays the full JIT cost (~100 ms on OpenCL).
+    {
+        const cv::Size yolo_sz(m_cfg.yolo.input_width, m_cfg.yolo.input_height);
+        cv::Mat warmup_blob = cv::Mat::zeros(1, 3 * yolo_sz.width * yolo_sz.height, CV_32F);
+        warmup_blob = warmup_blob.reshape(0, {1, 3, yolo_sz.height, yolo_sz.width});
+        m_net.setInput(warmup_blob);
+        std::vector<cv::Mat> warmup_outs;
+        try {
+            m_net.forward(warmup_outs, m_output_layers);
+            DS_INFO("YoloTracker: warmup pass complete\n");
+        } catch (const cv::Exception& e) {
+            DS_WARN("YoloTracker: warmup pass failed (%s) — first inference may be slow\n",
+                    e.what());
+        }
+    }
+
+    m_loaded = true;
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // process — run inference and return NMS-filtered DsBbox list
 // ---------------------------------------------------------------------------
-std::vector<DsBbox> YoloTracker::process(const cv::Mat& frame) {
+std::vector<DsBbox> YoloTracker::process(const cv::Mat& frame, uint64_t seq) {
     if (!m_loaded || frame.empty()) return {};
 
     // ------------------------------------------------------------------
     // 1. Build 4D blob from frame
-    //    The pipeline delivers BGRx (4-channel).  blobFromImage / the
-    //    first YOLO convolution expects exactly 3 channels.
-    //    Convert BGRx → BGR (zero-copy colour conversion, no resize yet).
+    //    Resize to YOLO input size FIRST (on the small image), then convert
+    //    BGRx → BGR.  This avoids running cvtColor on the full capture
+    //    resolution (e.g. 1280×720) only to immediately discard the result
+    //    during the resize inside blobFromImage.
     // ------------------------------------------------------------------
+    const cv::Size yolo_sz(m_cfg.yolo.input_width, m_cfg.yolo.input_height);
+    const uint64_t t_resize0 = ds_mono_us();
+    cv::Mat small;
+    cv::resize(frame, small, yolo_sz, 0, 0, cv::INTER_LINEAR);
+
     cv::Mat bgr;
-    if (frame.channels() == 4) {
-        cv::cvtColor(frame, bgr, cv::COLOR_BGRA2BGR);
+    if (small.channels() == 4) {
+        cv::cvtColor(small, bgr, cv::COLOR_BGRA2RGB); // fused swap: skips swapRB in blobFromImage
     } else {
-        bgr = frame; // already 3-channel
+        cv::cvtColor(small, bgr, cv::COLOR_BGR2RGB);
     }
 
     cv::Mat blob;
     cv::dnn::blobFromImage(bgr,
                            blob,
                            1.0 / 255.0,
-                           cv::Size(m_cfg.yolo.input_width, m_cfg.yolo.input_height),
+                           yolo_sz,
                            cv::Scalar(0, 0, 0),
-                           /*swapRB=*/true,
+                           /*swapRB=*/false,   // already RGB from cvtColor above
                            /*crop=*/false);
     m_net.setInput(blob);
+    const uint64_t t_resize1 = ds_mono_us();
 
     // ------------------------------------------------------------------
     // 2. Forward pass
     // ------------------------------------------------------------------
     std::vector<cv::Mat> outs;
     m_net.forward(outs, m_output_layers);
+    const uint64_t t_forward1 = ds_mono_us();
 
     // ------------------------------------------------------------------
     // 3. Parse detections
@@ -226,6 +262,13 @@ std::vector<DsBbox> YoloTracker::process(const cv::Mat& frame) {
     std::vector<int> indices;
     cv::dnn::NMSBoxes(boxes, confidences, m_cfg.yolo.conf_threshold,
                       m_cfg.yolo.nms_threshold, indices);
+    const uint64_t t_nms1 = ds_mono_us();
+
+    DS_DBG("YoloTracker: seq=%" PRIu64 "  resize+blob=%" PRIu64 " us  forward=%" PRIu64 " us  nms=%" PRIu64 " us\n",
+           seq,
+           t_resize1  - t_resize0,
+           t_forward1 - t_resize1,
+           t_nms1     - t_forward1);
 
     // ------------------------------------------------------------------
     // 5. Convert to DsBbox list
@@ -248,7 +291,6 @@ std::vector<DsBbox> YoloTracker::process(const cv::Mat& frame) {
         result.push_back(b);
     }
 
-    DS_TRACE("YoloTracker: %zu boxes after NMS\n", result.size());
     return result;
 }
 
@@ -267,7 +309,7 @@ bool YoloTracker::init(int width, int height) {
     return false;
 }
 
-std::vector<DsBbox> YoloTracker::process(const cv::Mat& /*frame*/) {
+std::vector<DsBbox> YoloTracker::process(const cv::Mat& /*frame*/, uint64_t /*seq*/) {
     return {};
 }
 

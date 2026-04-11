@@ -87,6 +87,7 @@ bool ConfigLoader::load_source(const std::string& path, DsSourceConfig& out) {
             out.detectors.enable_stub = jget<bool>(d, "enable_stub", true);
             out.detectors.enable_mog2 = jget<bool>(d, "enable_mog2", true);
             out.detectors.enable_yolo = jget<bool>(d, "enable_yolo", true);
+            out.detectors.dummy_bbox  = jget<bool>(d, "dummy_bbox",  false);
 
             out.detectors.mog2_history       = jget<int>   (d, "mog2_history",       500);
             out.detectors.mog2_var_threshold  = jget<double>(d, "mog2_var_threshold", 16.0);
@@ -102,6 +103,7 @@ bool ConfigLoader::load_source(const std::string& path, DsSourceConfig& out) {
                 out.detectors.yolo.input_width    = jget<int>        (y, "input_width",    416);
                 out.detectors.yolo.input_height   = jget<int>        (y, "input_height",   416);
                 out.detectors.yolo.backend        = jget<std::string>(y, "backend",        "cpu");
+                out.detectors.yolo.num_threads    = jget<int>        (y, "num_threads",    0);
                 // filter_classes: optional array of class name strings
                 if (y.contains("filter_classes") && y.at("filter_classes").is_array()) {
                     for (const auto& item : y.at("filter_classes"))

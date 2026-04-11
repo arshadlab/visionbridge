@@ -36,34 +36,38 @@ bool SourceNode::init() {
     // ----- Build tracker list -----
     std::vector<std::unique_ptr<ITracker>> trackers;
 
-    if (det.enable_stub) {
-        auto t = std::make_unique<StubTracker>();
-        if (t->init(W, H)) {
-            DS_INFO("SourceNode: StubTracker enabled\n");
-            trackers.push_back(std::move(t));
+    if (det.dummy_bbox) {
+        DS_INFO("SourceNode: dummy_bbox mode — skipping all trackers, sending empty bbox per frame\n");
+    } else {
+        if (det.enable_stub) {
+            auto t = std::make_unique<StubTracker>();
+            if (t->init(W, H)) {
+                DS_INFO("SourceNode: StubTracker enabled\n");
+                trackers.push_back(std::move(t));
+            }
         }
-    }
 
-    if (det.enable_mog2) {
-        auto t = std::make_unique<Mog2Tracker>(det);
-        if (t->init(W, H)) {
-            DS_INFO("SourceNode: Mog2Tracker enabled\n");
-            trackers.push_back(std::move(t));
+        if (det.enable_mog2) {
+            auto t = std::make_unique<Mog2Tracker>(det);
+            if (t->init(W, H)) {
+                DS_INFO("SourceNode: Mog2Tracker enabled\n");
+                trackers.push_back(std::move(t));
+            }
         }
-    }
 
-    if (det.enable_yolo) {
-        auto t = std::make_unique<YoloTracker>(det);
-        if (t->init(W, H)) {
-            DS_INFO("SourceNode: YoloTracker enabled\n");
-            trackers.push_back(std::move(t));
-        } else {
-            DS_WARN("SourceNode: YoloTracker disabled (model missing or DNN unavailable)\n");
+        if (det.enable_yolo) {
+            auto t = std::make_unique<YoloTracker>(det);
+            if (t->init(W, H)) {
+                DS_INFO("SourceNode: YoloTracker enabled\n");
+                trackers.push_back(std::move(t));
+            } else {
+                DS_WARN("SourceNode: YoloTracker disabled (model missing or DNN unavailable)\n");
+            }
         }
-    }
 
-    if (trackers.empty())
-        DS_WARN("SourceNode: no detectors initialised — bbox channel will be silent\n");
+        if (trackers.empty())
+            DS_WARN("SourceNode: no detectors initialised — bbox channel will be silent\n");
+    }
 
     // ----- Construct pipeline -----
     m_pipeline = std::make_unique<CapturePipeline>(m_cfg, std::move(trackers));

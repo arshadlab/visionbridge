@@ -12,6 +12,8 @@
 #include "../render/stream_decoder.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -54,8 +56,10 @@ public:
 // ---------------------------------------------------------------------------
 class BboxReceiver {
 public:
-    static constexpr int      kRingSize      = 16; ///< bbox ring depth (increased)
+    static constexpr int      kRingSize      = 16; ///< bbox ring depth
     static constexpr uint64_t kMaxSkewFrames = 4;  ///< max seq delta for fallback match
+    /// Timeout used by wait_for_seq() before logging an error and giving up.
+    static constexpr uint64_t kBboxWaitTimeoutUs = 1'000'000ULL; // 1 second
 
     struct Entry {
         uint64_t                   frame_seq = 0;
@@ -79,6 +83,16 @@ public:
      */
     std::shared_ptr<DsMsgBbox> best_for_frame(const DecodedFrame* frame);
 
+    /**
+     * Block until a bbox with exactly frame_seq == seq arrives, or timeout_us
+     * elapses.  Returns the matching message, or nullptr if timed out.
+     * Intended for use when SEI seq# is available; the caller should log an
+     * error on nullptr (no bbox arrived within the expected window).
+     * Falls through immediately when the entry is already in the ring.
+     */
+    std::shared_ptr<DsMsgBbox> wait_for_seq(uint64_t seq,
+                                            uint64_t timeout_us = kBboxWaitTimeoutUs);
+
     /** Print bbox-frame sync quality stats if the interval has elapsed. */
     void emit_sync_stats_if_due(uint64_t now_mono_us);
 
@@ -95,6 +109,7 @@ private:
     Entry     m_ring[kRingSize]{};
     size_t    m_ring_head = 0;
     std::mutex m_mtx;
+    std::condition_variable m_bbox_cv; ///< signalled by recv_loop on every push
 
     // Clock-skew one-time warning
     bool m_clock_skew_warned = false;

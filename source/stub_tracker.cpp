@@ -20,7 +20,7 @@ bool StubTracker::init(int width, int height) {
 // The box centre oscillates on a Lissajous-like path so that it moves
 // visibly across the frame and the overlay clearly updates each frame.
 // ---------------------------------------------------------------------------
-std::vector<DsBbox> StubTracker::process(const cv::Mat& /*frame*/) {
+std::vector<DsBbox> StubTracker::process(const cv::Mat& /*frame*/, uint64_t /*seq*/) {
     const double t = static_cast<double>(m_seq++) * 0.033; // ~30fps → 1 s per cycle
 
     // Box size: ~25% of frame

@@ -7,6 +7,7 @@
 #include "../common/logger.h"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <cinttypes>
 
 Mog2Tracker::Mog2Tracker(const DetectorConfig& cfg) : m_cfg(cfg) {}
 
@@ -33,7 +34,7 @@ bool Mog2Tracker::init(int width, int height) {
 // ---------------------------------------------------------------------------
 // process — run MOG2, extract contours, return DsBbox list
 // ---------------------------------------------------------------------------
-std::vector<DsBbox> Mog2Tracker::process(const cv::Mat& frame) {
+std::vector<DsBbox> Mog2Tracker::process(const cv::Mat& frame, uint64_t /*seq*/) {
     if (frame.empty()) return {};
 
     // --- 1. Convert to grayscale ---
@@ -96,6 +97,5 @@ std::vector<DsBbox> Mog2Tracker::process(const cv::Mat& frame) {
         result.push_back(b);
     }
 
-    DS_TRACE("Mog2Tracker: %zu boxes\n", result.size());
     return result;
 }
